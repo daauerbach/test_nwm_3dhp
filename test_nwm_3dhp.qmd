@@ -1,0 +1,640 @@
+---
+title: "NWM on 3DHP testing"
+author: "dan.auerbach@dfw.wa.gov"
+date: "`r Sys.Date()`"
+format:
+  html:
+    embed-resources: true
+    theme: yeti 
+    code-fold: true
+    toc: true
+    toc-location: left
+    grid:
+      sidebar-width: 180px
+      body-width: 1100px
+      margin-width: 20px
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE, fig.width = 8, fig.height = 8)
+
+library("tidyverse", quietly = T)
+library("sf")
+library("patchwork")
+library("gt")
+theme_set(theme_minimal()) 
+
+dir_data_common <- "~/T/DFW-Team WDFW Watershed Synthesis - data_common"
+epsg <- 2927 #WA state standard; NAD83(HARN)/ft
+
+```
+
+# objects
+
+```{r sf_fpb, eval=FALSE}
+sf_fpb <- sf::read_sf(
+  file.path(dir_data_common,"WdfwFishPassage.gdb"), 
+  layer = "WDFW_FishPassageSite") |> 
+  sf::st_transform(epsg) |> 
+  rename_with(.cols = starts_with("FishPassage"), .fn = ~str_replace(., "FishPassage","FP")) |> 
+  filter(
+    FPFeatureTypeCode==1 #culverts
+    # #!is.na(BarrierCorrectionTypeCode)
+    # !is.na(BarrierCorrectionYearsText)
+  ) |> 
+  mutate(
+    fish_use = case_when(
+      FishUseCode == 10 ~ "yes",
+      FishUseCode == 20 ~ "no",
+      FishUseCode == 99 ~ "unk"
+    )
+  ) |> 
+  left_join(
+    tibble(
+      OwnerTypeCode = c(1:7,9,10,12), 
+      owner = c("city", "county", "federal", "private", "state", "tribal", "other", "drainage_dist", "diking_dist", "unk")
+    ),
+    by = "OwnerTypeCode"
+  )
+```
+
+```{r sf_nhdp_wa, eval=FALSE}
+# #med res NHDplus, 230K polys including non-WA, no attrib but FEATUREID==COMID for StreamCat join
+# sf_nhdp <- sf::read_sf(file.path(dir_data_common, "NHDPlus17/NHDPlusCatchment/Catchment.shp")) |>
+#   sf::st_transform(crs = sf::st_crs(epsg)) |>
+#   select(COMID = FEATUREID, areasqkm = AreaSqKM)
+# 
+# #use StreamCat for WA to nonspatially subset catchment polys
+# sf_nhdp_wa <- inner_join(
+#   sf_nhdp |> mutate(comid = as.character(COMID))
+#   ,
+#   StreamCatTools::sc_nlcd(state = "WA", year = "2019", aoi = 'riparian_watershed') |>
+#     rename_with(tolower) |> as_tibble() |>
+#     mutate(comid = as.character(comid)) |> 
+#     select(comid, state)
+#   ,
+#   by = "comid")
+# 
+# saveRDS(sf_nhdp_wa, "~/T/DFW-Team WDFW Watershed Synthesis - flow_trees_heat/sf_nhdp_wa.rds")
+
+sf_nhdp_wa <- readRDS("~/T/DFW-Team WDFW Watershed Synthesis - flow_trees_heat/sf_nhdp_wa.rds")
+```
+
+```{r lines_3dhp, eval=FALSE}
+sf::st_layers(file.path(dir_data_common, "3dhp/17110008_EDH_230605.gdb"))
+
+# #after initial read before select()
+# as_tibble(lines) |> #glimpse()
+#   #count(FClass, EClass) #Fclass all 1, Eclass 0,2,3
+#   #count(Source) #all "Lidar YYYY", mostly 2017 and 2013
+#   #count(Method) #all "Flow direction and accumulation combined with proprietary methods"
+#   #count(UserCode) #all NA except 2 " "
+#   #count(Comments) #mostly NA, sort of interesting but probably not standard, in USGS?
+#   count(GNIS_Name) #100 names and a few versions of blanks and nulls
+
+#in 2927, 74K, note XYZ-ness
+lines_3dhp <- sf::st_read(file.path(dir_data_common, "3dhp/17110008_EDH_230605.gdb"), layer = "Lines") |> 
+  select(-c(FClass, Method, UserCode, Comments))
+
+# lines_3dhp |> 
+#   #as_tibble() |> glimpse()
+#   ggplot() + geom_sf(aes(color = Source))
+
+```
+
+
+# Flow regime via NWM on 3DHP
+
+```{r nwm_zarr_pull3, eval=FALSE}
+#revised from flow_trees_apps.qmd, which built per-year rds objects into data_common/nmw_retro, moved into /v2_1
+
+# #https://github.com/grimbough/Rarr
+# if (!require("BiocManager", quietly = TRUE))
+#     install.packages("BiocManager")
+# ## install Rarr
+# BiocManager::install("Rarr")
+
+# remotes::install_github(repo = "grimbough/Rarr")
+
+library(tidyverse)
+library(sf)
+#for COMIDs all of WA
+sf_nhdp_wa <- readRDS("~/T/DFW-Team WDFW Watershed Synthesis - flow_trees_heat/sf_nhdp_wa.rds")
+sf_nhdp_wa_comid <- sf_nhdp_wa |> 
+    as_tibble() |> 
+    dplyr::filter(COMID > 0, areasqkm < 1500) |> 
+    select(comid = COMID)
+rm(sf_nhdp_wa)
+
+library(Rarr)
+
+#zarr_overview("https://noaa-nwm-retrospective-2-1-zarr-pds.s3.amazonaws.com/chrtout.zarr/streamflow/")
+#structure changes slightly between 2.1 and 3.0
+zarr_overview("https://noaa-nwm-retrospective-3-0-pds.s3.amazonaws.com/CONUS/zarr/chrtout.zarr/streamflow/")
+
+
+# #may be worth truncating largest and smallest?
+# as_tibble(sf_nhdp_wa) |> pull(areasqkm) |> summary()
+# as_tibble(sf_nhdp_wa) |> filter(between(areasqkm, 0, 1000)) |>  ggplot() + stat_ecdf(aes(areasqkm))
+# as_tibble(sf_nhdp_wa) |> arrange(desc(areasqkm))
+# as_tibble(sf_nhdp_wa) |> arrange(areasqkm)
+# as_tibble(sf_nhdp_wa) |> count(areasqkm < 0.001)
+# #several very large, largest are cross border
+# sf_nhdp_wa |> filter(areasqkm > 1500) |> select(-comid) |> mapview::mapview(zcol = "areasqkm")
+# #various very small, scattered throughout
+# sf_nhdp_wa |> filter(areasqkm < 0.001) |> select(-comid) |> sf::st_centroid() |> mapview::mapview(zcol = "areasqkm")
+
+# #unclear what is happening with the negative COMIDs
+# #somewhat randomly in the center of the state, some have NLCD riparian attrs
+# #no negatives in NWM zarr feature_id
+# as_tibble(sf_nhdp_wa) |> count(COMID < 0)
+# sf_nhdp_wa |> filter(COMID < 0) |> select(-comid) |> mapview::mapview(zcol = "areasqkm")
+# sf_nhdp_wa_nlcd19 |> filter(COMID < 0) |> as_tibble() |> print(n=100)
+
+
+#zarr 'feature_id' *values* are COMIDs, but index position in feature_id != COMID 
+#this reads the vector of all available NHD+ ids
+#then subsets to those in the WA catchment polygons (excluding 5 in Canada and those with negative COMIDs)
+#manually finding the correct url by hovering on html view; presumably a better way
+#https://noaa-nwm-retrospective-3-0-pds.s3.amazonaws.com/index.html#CONUS/zarr/chrtout.zarr/feature_id/
+
+# #submitted issue:  https://github.com/grimbough/Rarr/issues/10
+# #old, worked, seems likely would now fail due to string rather than list datatype
+# array_path <- "https://noaa-nwm-retrospective-2-1-zarr-pds.s3.amazonaws.com/chrtout.zarr/feature_id/"
+# Rarr:::read_array_metadata(array_path)
+# #new, fails
+# array_path <- "https://noaa-nwm-retrospective-3-0-pds.s3.amazonaws.com/CONUS/zarr/chrtout.zarr/feature_id"  
+# metadata <- Rarr:::read_array_metadata(array_path)
+# #decompressor <- metadata$compressor$id # decompressor == "zstd", previously/above 'lz4'
+# #fails: NULL, key is '$dtype', value is '<i8' which breaks get_chunk_size()
+# datatype <- metadata$datatype
+# #still wrong, returns string "<i8"
+# datatype <- metadata$dtype 
+# #should be list from
+# datatype <- Rarr:::.parse_datatype(metadata$dtype)
+# #which allows declaration
+# buffer_size <- Rarr:::get_chunk_size(datatype, dimensions = metadata$chunks)
+
+## horrible debugging
+# #stepping through read_chunk
+# i = 1
+# chunk_id = required_chunks[i, ]
+# dim_separator <- ifelse(is.null(metadata$dimension_separator),
+#     yes = ".", no = metadata$dimension_separator
+#   )
+# chunk_id <- paste0(chunk_id, collapse = dim_separator)
+# #chunk_file <- paste0(zarr_array_path, chunk_id) #looks like a bad path, maybe part of problem?
+# chunk_file <- paste0(zarr_array_path,"/", chunk_id) #Yes
+# #in the 'else' of isnull(s3)
+# parsed_url <- Rarr:::parse_s3_path(chunk_file)
+# #fails/returns NULL without coercing in the '/', fetches when included
+# if(Rarr:::.s3_object_exists(s3_client, parsed_url$bucket, parsed_url$object)) {
+#   compressed_chunk <- s3_client$get_object(Bucket = parsed_url$bucket,
+#                                            Key = parsed_url$object)$Body
+# }
+# decompressed_chunk <- Rarr:::.decompress_chunk(compressed_chunk, metadata)
+# #this is where the "e-320" appears
+# converted_chunk <- Rarr:::.format_chunk(decompressed_chunk, metadata, alt_chunk_dim)
+# 
+# alt_chunk_dim <- unlist(metadata$chunks) #declared in extract_elements and passed
+# datatype <- metadata$datatype
+# actual_chunk_size <- length(decompressed_chunk) / datatype$nbytes
+# if((datatype$base_type == "py_object") || (actual_chunk_size == prod(unlist(metadata$chunks)))) {
+#     chunk_dim <- unlist(metadata$chunks)
+#   } else if (actual_chunk_size == prod(alt_chunk_dim)) {
+#     chunk_dim <- alt_chunk_dim
+#   }
+# output_type <- switch(datatype$base_type,
+#                       "boolean" = 0L,
+#                       "int" = 1L,
+#                       "uint" = 1L,
+#                       "float" = 2L
+# )
+# converted_chunk <- .Call("type_convert_chunk", decompressed_chunk,
+#                              1L, #output_type, 
+#                              datatype$nbytes, 
+#                              datatype$is_signed,
+#                              chunk_dim,
+#                              PACKAGE = "Rarr"
+#     )
+
+# #trying to actually get the data, can prob due featureID part manually as fallback but not workable for flows
+# #stepping throug read_zarr_array
+# zarr_array_path <- "https://noaa-nwm-retrospective-3-0-pds.s3.amazonaws.com/CONUS/zarr/chrtout.zarr/feature_id"  
+# s3_client <- Rarr:::.create_s3_client(path = zarr_array_path)
+# metadata <- Rarr:::read_array_metadata(zarr_array_path)
+# metadata$datatype
+# metadata$datatype$base_type <- "float" #corrects buffer_size but not missing slash
+# index <- vector(mode = "list", length = length(metadata$shape))
+# index <- Rarr:::check_index(index = index, metadata = metadata)
+# required_chunks <- as.matrix(Rarr:::find_chunks_needed(metadata, index))
+# 
+# #now step down into read_data
+# #so deconstruct Rarr:::read_data
+# chunk_idx <- mapply(\(x,y) { (x-1) %/% y }, index, metadata$chunks, SIMPLIFY = FALSE)
+# #now step down into chunk_selections declaration
+# #which means into .extract_elements and then into read_chunk and .format_chunk
+
+
+my_format_chunk <- function (decompressed_chunk, metadata, alt_chunk_dim) 
+{
+    datatype <- metadata$datatype
+    actual_chunk_size <- length(decompressed_chunk)/datatype$nbytes
+    if ((datatype$base_type == "py_object") || (actual_chunk_size == 
+        prod(unlist(metadata$chunks)))) {
+        chunk_dim <- unlist(metadata$chunks)
+    }
+    else if (actual_chunk_size == prod(alt_chunk_dim)) {
+        chunk_dim <- alt_chunk_dim
+    }
+    else {
+        stop("Decompresed data doesn't match expected chunk size.")
+    }
+    if (metadata$order == "C") {
+        chunk_dim <- rev(chunk_dim)
+    }
+    if (datatype$base_type == "string") {
+        converted_chunk <- .format_string(decompressed_chunk, 
+            datatype)
+        dim(converted_chunk[[1]]) <- chunk_dim
+    }
+    else if (datatype$base_type == "unicode") {
+        converted_chunk <- .format_unicode(decompressed_chunk, 
+            datatype)
+        dim(converted_chunk[[1]]) <- chunk_dim
+    }
+    else if (datatype$base_type == "py_object") {
+        converted_chunk <- .format_object(decompressed_chunk, 
+            metadata, datatype)
+        dim(converted_chunk[[1]]) <- chunk_dim
+    }
+    else {
+        output_type <- switch(datatype$base_type, boolean = 0L, 
+#            int = 1L, uint = 1L, float = 2L)
+            int = 1L, uint = 1L, float = 1L) #force float to 1L, not a general fix
+        converted_chunk <- .Call("type_convert_chunk", decompressed_chunk, 
+            output_type, datatype$nbytes, datatype$is_signed, 
+           chunk_dim, PACKAGE = "Rarr")
+    }
+    if (metadata$order == "C") {
+        converted_chunk[[1]] <- aperm(converted_chunk[[1]])
+    }
+    names(converted_chunk) <- c("chunk_data", "warning")
+    return(converted_chunk)
+}
+
+#changes: add Rarr::: throughout; update chunk_file declaration to include '/' 
+my_read_chunk <- function (zarr_array_path, chunk_id, metadata, s3_client = NULL, 
+    alt_chunk_dim = NULL) 
+{
+    if (missing(metadata)) {
+        metadata <- Rarr:::read_array_metadata(zarr_array_path, s3_client = s3_client)
+    }
+    dim_separator <- ifelse(is.null(metadata$dimension_separator), 
+        yes = ".", no = metadata$dimension_separator)
+    chunk_id <- paste(chunk_id, collapse = dim_separator)
+    datatype <- metadata$datatype
+#    chunk_file <- paste0(zarr_array_path, chunk_id)
+    chunk_file <- paste0(zarr_array_path,"/", chunk_id)
+
+    if (nzchar(Sys.getenv("RARR_DEBUG"))) {
+        message(chunk_file)
+    }
+    if (is.null(s3_client)) {
+        size <- file.size(chunk_file)
+        if (file.exists(chunk_file)) {
+            compressed_chunk <- readBin(con = chunk_file, what = "raw", 
+                n = size)
+        }
+        else {
+            compressed_chunk <- NULL
+        }
+    }
+    else {
+        parsed_url <- Rarr:::parse_s3_path(chunk_file)
+        if (Rarr:::.s3_object_exists(s3_client, parsed_url$bucket, parsed_url$object)) {
+            compressed_chunk <- s3_client$get_object(Bucket = parsed_url$bucket, 
+                Key = parsed_url$object)$Body
+        }
+        else {
+            compressed_chunk <- NULL
+        }
+    }
+    if (!is.null(compressed_chunk)) {
+        decompressed_chunk <- Rarr:::.decompress_chunk(compressed_chunk, 
+            metadata)
+#        converted_chunk <- Rarr:::.format_chunk(decompressed_chunk, 
+        converted_chunk <- my_format_chunk(decompressed_chunk, 
+            metadata, alt_chunk_dim)
+    }
+    else {
+        converted_chunk <- list(chunk_data = array(metadata$fill_value, 
+            dim = unlist(metadata$chunks)), warning = 0L)
+    }
+    return(converted_chunk)
+}
+
+#need to declare here as not even ':::' available
+#also changing to:   chunk <- my_read_chunk(
+my_extract_elements <- function(i, metadata, index, required_chunks, zarr_array_path, s3_client, chunk_idx) {
+  ## find elements to select from the chunk and what in the output we replace
+  index_in_result <- index_in_chunk <- list()
+  alt_chunk_dim <- unlist(metadata$chunks)
+  
+  for (j in seq_len(ncol(required_chunks))) {
+    index_in_result[[j]] <- which(chunk_idx[[j]] == required_chunks[i, j])
+    ## are we requesting values outside the array due to overhanging chunks?
+    outside_extent <- index_in_result[[j]] > metadata$shape[[j]]
+    if (any(outside_extent))
+      index_in_result[[j]] <- index_in_result[[j]][-outside_extent]
+    if (any(index_in_result[[j]] == metadata$shape[[j]])) 
+      alt_chunk_dim[j] <- length(index_in_result[[j]])
+    
+    index_in_chunk[[j]] <- ((index[[j]][index_in_result[[j]]] - 1) %% metadata$chunks[[j]]) + 1
+  }
+  
+  ## read this chunk
+  #chunk <- Rarr:::read_chunk(
+  chunk <- my_read_chunk(
+    zarr_array_path,
+    chunk_id = required_chunks[i, ],
+    metadata = metadata,
+    s3_client = s3_client,
+    alt_chunk_dim = alt_chunk_dim
+  )
+
+  warn <- chunk$warning[1]
+  chunk_data <- chunk$chunk_data
+  
+  ## extract the required elements from the chunk
+  selection <- R.utils::extract(chunk_data, indices = index_in_chunk, drop = FALSE)
+  
+  return(list(selection, index_in_result, warning = warn))
+}
+
+#change to FUN = .extract_elements
+my_read_data <- function(required_chunks, zarr_array_path, s3_client, 
+                      index, metadata) {
+  warn <- 0L
+  
+  ## determine which chunk each of the requests indices belongs to
+  chunk_idx <- mapply(\(x,y) { (x-1) %/% y }, index, metadata$chunks, SIMPLIFY = FALSE)
+  
+  ## hopefully we can eventually do this in parallel
+  chunk_selections <- lapply(seq_len(nrow(required_chunks)), 
+                             #FUN = .extract_elements,
+                             FUN = my_extract_elements,
+                             metadata = metadata, index = index,
+                             required_chunks = required_chunks,
+                             zarr_array_path = zarr_array_path,
+                             s3_client = s3_client,
+                             chunk_idx = chunk_idx)
+  
+  ## predefine our array to be populated from the read chunks
+  output <- array(metadata$fill_value, dim = vapply(index, length, integer(1)))
+
+  ## proceed in serial and update the output with each chunk selection in turn
+  for (i in seq_along(chunk_selections)) {
+    index_in_result <- chunk_selections[[i]][[2]]
+    cmd <- Rarr:::.create_replace_call(x_name = "output", idx_name = "index_in_result",
+                                idx_length = length(index_in_result), 
+                                y_name = "chunk_selections[[i]][[1]]")
+    eval(parse(text = cmd))
+    warn <- max(warn, chunk_selections[[i]]$warning[1])
+  }
+  return(list(output = output, warn = warn))
+}
+
+my_read_zarr_array <- function (zarr_array_path, index, s3_client) 
+{
+    zarr_array_path <- Rarr:::.normalize_array_path(zarr_array_path)
+    if (missing(s3_client)) 
+        s3_client <- Rarr:::.create_s3_client(path = zarr_array_path)
+    metadata <- Rarr:::read_array_metadata(zarr_array_path, s3_client = s3_client)
+    #yikes
+    metadata$datatype$base_type <- "float"
+    
+    if (missing(index)) {
+        index <- vector(mode = "list", length = length(metadata$shape))
+    }
+    index <- Rarr:::check_index(index = index, metadata = metadata)
+    required_chunks <- as.matrix(Rarr:::find_chunks_needed(metadata, index))
+    res <- my_read_data(required_chunks, zarr_array_path, s3_client, index, metadata)
+    if (isTRUE(res$warn > 0)) {
+        warning("Integer overflow detected in at least one chunk.\n", 
+            "Overflowing values have been replaced with NA", 
+            call. = FALSE)
+    }
+    return(res$output)
+}
+
+#res <- Rarr:::read_data(required_chunks, zarr_array_path, s3_client, index, metadata)
+#my_read_data(required_chunks, zarr_array_path, s3_client, index, metadata)$output
+
+#Now runs...to 56K tibble
+feat_id <- tibble(
+  # #v2.1: comid = read_zarr_array("https://noaa-nwm-retrospective-2-1-zarr-pds.s3.amazonaws.com/chrtout.zarr/feature_id/")
+  comid = my_read_zarr_array("https://noaa-nwm-retrospective-3-0-pds.s3.amazonaws.com/CONUS/zarr/chrtout.zarr/feature_id")
+) |> 
+  tibble::rowid_to_column(var = "i") |> 
+  inner_join(sf_nhdp_wa_comid, by = "comid")
+
+# {
+#     "_ARRAY_DIMENSIONS": [
+#         "time",
+#         "feature_id"
+#     ],
+#     "add_offset": 0.0,
+#     "coordinates": "latitude longitude",
+#     "grid_mapping": "crs",
+#     "long_name": "River Flow",
+#     "missing_value": -999900,
+#     "scale_factor": 0.009999999776482582,
+#     "units": "m3 s-1"
+# }
+# Shape: 385704 x 2776734
+# Chunk Shape: 672 x 30000
+# No. of Chunks: 53382 (574 x 93)
+# Data Type: int32
+
+# q <- my_read_zarr_array(
+#   "https://noaa-nwm-retrospective-3-0-pds.s3.amazonaws.com/CONUS/zarr/chrtout.zarr/streamflow/"
+#   ,
+#   index = list(1, feat_id$i)
+# )
+
+
+#for now hard coding expectation of passing year, month and hour(s)
+#could add logic for other NULL handling to build time_dim_ind more flexibly
+#defaults for single hour per day through full month (13:00 Aug 2020)
+#may be faster to pull, for example, Apr-Sep rather than looping single months
+#but then have [too] big objects and have to load and subset?
+dir_data_common <- "~/T/DFW-Team WDFW Watershed Synthesis - data_common"
+
+pull_nwm_zarr <- function(
+    #s3_address = "https://noaa-nwm-retrospective-2-1-zarr-pds.s3.amazonaws.com/chrtout.zarr/streamflow/",
+    s3_address =   "https://noaa-nwm-retrospective-3-0-pds.s3.amazonaws.com/CONUS/zarr/chrtout.zarr/streamflow/",
+    y = 2022,
+    m = 8,
+    h = 13,
+    feat = feat_id,
+    dir_write = file.path(dir_data_common, "nwm_retro/v3_0")
+) {
+  sclfctr <- 0.009999999776482582
+  cms2cfs <- 35.31468492
+  
+  #vector of all time available, v2.1 length was 367439
+  time_dim <- seq(as.POSIXct("1979-02-01 01:00:00", tz = 'UTC'), length.out = 385704, by = "1 hour")
+  #indices of desired subset
+  time_i <- which(
+    #year(time_dim) %in% 2023 & month(time_dim) %in% 8 & hour(time_dim) %in% 13
+    year(time_dim) %in% y &
+      month(time_dim) %in% m &
+      hour(time_dim) %in% h
+    )
+  
+  print(Sys.time())
+  z <- my_read_zarr_array(s3_address, index = list(time_i, feat$i)) |> 
+    as.data.frame() |> 
+    set_names(feat$comid) |> 
+    as_tibble() |> 
+    mutate(
+      #correct 'scale factor' brings to cms, then to cfs
+      across(everything(), ~.* sclfctr * cms2cfs),
+      across(everything(), ~if_else(.<0, NA_real_, .)),
+      i = time_dim[time_i], #col of POSIXct
+      m = month(i),
+      yday = yday(i)
+    )
+  print(Sys.time())
+  
+  if(!is.null(dir_write)){
+    if(identical(m, 1:12)) {
+      f = file.path(dir_write, paste0("nwm_wa_",y, ".rds"))
+    } else {
+      f = file.path(dir_write, paste0("nwm_wa_",y,"_",paste0(str_pad(m,width = 2, pad = "0"),collapse = ""), ".rds"))
+    }
+    print(paste("data written to ", f))
+    saveRDS(z, f)
+  } else {
+    return(z)
+  }
+}
+
+# #365 days at 13:00 
+# q <- pull_nwm_zarr(dir_write = NULL, y = 2022, m = 12)
+# dim(as.matrix(q)); tail(names(q))
+# q2 <- q |> select(-c(i:yday)) |> as.matrix()
+# dim(q2)
+# apply(q2,1, max, na.rm = T) #impossibly high values...>200k cfs
+# rowMeans(q2)
+# apply(q2,1, \(x) sum(is.na(x)))
+# apply(q2,1, \(x) sum(x<0, na.rm = T)) #fixed, could drop these comids?
+# #colnames(q2)[q2[1,]<0]
+# colnames(q2)[q2[1,]<0]
+# q2 <- q2[,!(is.na(q2[1,]))]
+# rowMeans(q2)
+# apply(q2,1, min)
+# #okay looks like just a few weird/bad spots but the rescaling is correct
+# plot.ecdf(q2[1,]) ; abline(v=c(10000,50000), col = 2:3)
+
+# #default single hour (13:00) per day
+# about 1m30s per y-m
+# some change somewhere seems to have made less memory stable? 
+# throws stubborn mem limit error after about 10 y-m
+# gc() and googling did not show a better quick fix than just restarting session
+# could script a meta-loop that spawns & provisions new session(s)
+# either with Rscript or callr::r_bg, https://callr.r-lib.org/ 
+# but this feels provisional and easy enough to babysit while doing other things
+x <- expand_grid(y = 2021:2000, m = 1:12)
+(x <- x |> filter(!(y == 2021 & m < 12)))
+# for(i in seq_len(nrow(x))){
+#   print(x[i,"y"]); print(x[i,"m"])
+#   pull_nwm_zarr(y = x[i,"y"], m = x[i,"m"])
+# }
+
+#got annoyed and wrote something that starts fresh each y-m and seems more memory stable?
+file.exists("~/T/DFW-Team WDFW Watershed Synthesis - General/hydrography/testing/nwm3_hacky_ym.R")
+
+for(i in seq_len(nrow(x))){
+  system2(
+    command = "Rscript",
+    args = c(
+      #tilde expansion does NOT work
+      shQuote("/Users/auerbdaa/T/DFW-Team WDFW Watershed Synthesis - General/hydrography/testing/nwm3_hacky_ym.R"),
+      x[i,"y"], x[i,"m"]
+    )
+  )
+  }
+
+```
+
+```{r nwm_on_3dhp}
+
+aoi <- st_as_sfc(st_bbox(lines_3dhp))
+sf_nhdp_wa_aoi <- sf_nhdp_wa[aoi,]
+ggplot() + geom_sf(data = sf_nhdp_wa_aoi, fill = NA) + geom_sf(data = aoi, color = "purple", fill = NA)
+
+#not bad, maybe ~1min?
+lines_3dhp <- st_join(
+  lines_3dhp,
+  sf_nhdp_wa_aoi |> select(-state),
+  join = st_intersects, #st_crosses?
+  largest = T
+)
+
+#where is the greatest density of 3dhp lines in NHDplus MR catchments?
+sf_nhdp_wa_aoi |> 
+  left_join(
+    lines_3dhp |> as_tibble() |> count(comid, name = "n_3dhp") |> arrange(desc(n_3dhp))    
+    , by = "comid"
+  ) |> 
+  drop_na(n_3dhp) |> 
+  ggplot() + geom_sf(aes(color = n_3dhp, fill = n_3dhp)) + 
+  wacolors::scale_color_wa_c("sea", reverse = T, aesthetics = c("color","fill")) + 
+  labs(title = "Pilot 3DHP lines per med res NHDplus catchments")
+
+
+#NWM 2022 testing values
+q_3dhp <- q |> 
+  select(m, yday, which(colnames(q) %in% as.character(unique(lines_3dhp$comid)))) |> 
+  mutate(across(-c(m, yday), ~if_else(.<0 , NA_real_, .)))
+
+q_3dhp_daily_summary <- q_3dhp |> 
+  pivot_longer(cols = -c(m, yday), names_to = "comid", values_to = "cfs") |> 
+  summarise(
+    across(
+      cfs, list(
+        min = ~min(.), med = ~median(.), max = ~max(.),
+        cv = ~sd(.) / mean(.)
+        )
+      ),
+    .by = "comid"
+    )
+
+#add back to spatial objects
+sf_nhdp_wa_aoi <- sf_nhdp_wa_aoi |> left_join(q_3dhp_daily_summary, by = "comid")
+lines_3dhp <- lines_3dhp |> left_join(q_3dhp_daily_summary, by = "comid")
+
+map(
+  names(q_3dhp_daily_summary)[-1]
+  ,
+  ~sf_nhdp_wa_aoi |> 
+    drop_na(cfs_min) |> 
+    ggplot() + geom_sf(aes(color = eval(as.name(.x)), fill = eval(as.name(.x)))) +
+    wacolors::scale_color_wa_c("diablo", reverse = T, aesthetics = c("color","fill")) +
+    guides(color = guide_colorbar(.x), fill = guide_none())
+  ) |> 
+  wrap_plots(ncol = 2) +
+  plot_annotation(subtitle = "NWM 3.0 2022 per med res NHDplus catchments")
+
+
+lines_3dhp |> 
+  ggplot() +
+  geom_sf(aes(color = cfs_cv)) + 
+  wacolors::scale_color_wa_c("stuart", midpoint = 1)
+
+
+```
+
