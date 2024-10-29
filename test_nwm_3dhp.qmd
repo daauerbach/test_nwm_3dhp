@@ -101,6 +101,9 @@ lines_3dhp <- sf::st_read(file.path(dir_data_common, "3dhp/17110008_EDH_230605.g
 #   #as_tibble() |> glimpse()
 #   ggplot() + geom_sf(aes(color = Source))
 
+# #not clear exactly where this is...
+# cat_3dhp <- sf::st_read(file.path(dir_data_common, "3dhp/1711000802_catchments/1711000802_catchments.shp"))
+
 ```
 
 cut nhdp to 3dhp & associate comid
@@ -121,19 +124,19 @@ lines_3dhp <- st_join(
 cut 3dhp to focal comid(s) & build network
 
 ```{r lines_3dhp_to_lsfn}
-#where is the greatest density of 3dhp lines in NHDplus MR catchments?
-sf_nhdp_wa_3dhp |> 
-  left_join(
-    lines_3dhp |> as_tibble() |> count(comid, name = "n_3dhp") |> arrange(desc(n_3dhp))    
-    , by = "comid"
-  ) |> 
-  drop_na(n_3dhp) |> 
-  ggplot() + geom_sf(aes(color = n_3dhp, fill = n_3dhp)) + 
-  wacolors::scale_color_wa_c("sea", reverse = T, aesthetics = c("color","fill")) + 
-  labs(title = "Pilot 3DHP lines per med res NHDplus catchments")
-
-#for now just take the comid with the greatest number of associated 3dhp line units: "24275471"
-lines_3dhp |> as_tibble() |> count(comid, name = "n_3dhp") |> arrange(desc(n_3dhp)) |> slice(1:10)
+# #where is the greatest density of 3dhp lines in NHDplus MR catchments?
+# sf_nhdp_wa_3dhp |> 
+#   left_join(
+#     lines_3dhp |> as_tibble() |> count(comid, name = "n_3dhp") |> arrange(desc(n_3dhp))    
+#     , by = "comid"
+#   ) |> 
+#   drop_na(n_3dhp) |> 
+#   ggplot() + geom_sf(aes(color = n_3dhp, fill = n_3dhp)) + 
+#   wacolors::scale_color_wa_c("sea", reverse = T, aesthetics = c("color","fill")) + 
+#   labs(title = "Pilot 3DHP lines per med res NHDplus catchments")
+# 
+# #for now just take the comid with the greatest number of associated 3dhp line units: "24275471"
+# lines_3dhp |> as_tibble() |> count(comid, name = "n_3dhp") |> arrange(desc(n_3dhp)) |> slice(1:10)
 
 # #test if multilinestring is actually more than single line
 # #not, anywhere in the full set actually
@@ -141,15 +144,7 @@ lines_3dhp |> as_tibble() |> count(comid, name = "n_3dhp") |> arrange(desc(n_3dh
 # any(map_int(st_geometry(lines_3dhp), length) > 1)
 
 
-#create sfnetwork object with nodes and edges that have from/to attributes added...
-#identical feature count, follows from length(geometry()) test
-lsfn <- lines_3dhp |> 
-  filter(comid == "24275471") |> 
-  select(uid = UniqueID, shape_length = SHAPE_Length, comid) |> 
-  st_cast("LINESTRING") |> 
-  sfnetworks::as_sfnetwork()
-
-# #this 'rooted forest' has GIS artifact strays
+# #spatial bounds initially generate a 'rooted forest' with GIS artifact strays
 # ggplot() +
 #   geom_sf(data = st_as_sf(lsfn, "edges"), col = "lightblue", linewidth = 0.3) +
 #   geom_sf(
@@ -161,11 +156,18 @@ lsfn <- lines_3dhp |>
 #     color = "orange"
 #   )
 
-#can likely pipe this directly into original object declaration
-#but for now allows qaqc of intermediates
-#adds a calc'd topological distance for nodes which then associated to 'to' of edges
-#appears that the ground distance versions are 'from downstream node to downstream [root] node'
-lsfn <- lsfn |>
+
+#create sfnetwork object with nodes and edges that have from/to attributes added...
+#identical feature count, follows from length(geometry()) test
+#the convert to_largest_component drops GIS artifact strays from initial 'rooted forest'
+#then adds calc'd topological and length weighted distance for nodes which are then associated to 'to' of edges
+#map inspection that the ground distance versions are 'from downstream node to downstream [root] node'
+
+lsfn <- lines_3dhp |> 
+  filter(comid == "24275471") |> 
+  select(uid = UniqueID, shape_length = SHAPE_Length, comid) |> 
+  st_cast("LINESTRING") |> 
+  sfnetworks::as_sfnetwork() |> 
   tidygraph::activate(nodes) |> 
   tidygraph::convert(
     tidygraph::to_largest_component,
@@ -173,40 +175,73 @@ lsfn <- lsfn |>
   ) |> 
   mutate(
     idn = seq_along(SHAPE),
-    d_to_root = tidygraph::node_distance_to(tidygraph::node_is_root()),
-    d_to_root_ft = tidygraph::node_distance_to(tidygraph::node_is_root(), weights = shape_length),
-    d_to_root_km = 0.0003 * d_to_root_ft
+    #raindrop perspective paths from nodes to root
+    d_root = tidygraph::node_distance_to(tidygraph::node_is_root()),
+    d_root_ft = tidygraph::node_distance_to(tidygraph::node_is_root(), weights = shape_length),
+    d_root_km = 0.0003 * d_root_ft,
+    #looking 'up' perspective to perimeter from per-node 'me' 
+    in_n = tidygraph::local_size(order = nrow(tidygraph::.N()), mode = "in")
     ) 
 
-# #idn is 'to' of root edge == 892, edge uid should be 8004
-# #but idn != .tidygraph_node_index (created before the convert), 892 vs 900 for dtoroot0 
-# lsfn |> st_as_sf("edges") |> sf::st_zm() |> mapview::mapview()
-# lsfn |> st_as_sf("nodes") |> as_tibble() |> select(-SHAPE) |> arrange(d_to_root)
+# ## !! leaving this scoping block for now but can delete on stable/cleanup
+# z <- select(as_tibble(as_tibble(lsfn, active = "nodes")), idn, d_root, in_n) #1505 nodes
+# y <- select(as_tibble(as_tibble(lsfn, active = "edges")), uid, to, from, shape_length) #1504 edges
+# #nodes with no 'to' in the edgelist are leaves
+# z[setdiff(z$idn, y$to),] |> filter(in_n > 1) 
+# ggplot() + 
+#   geom_sf(data = as_tibble(lsfn, active = "edges"), color = "lightblue", linewidth = 0.5) +
+#   geom_sf(data = as_tibble(lsfn, active = "nodes"), color = "grey50", alpha = 0.5) +
+#   geom_sf(data = as_tibble(lsfn, active = "nodes") |> anti_join(y, by = c("idn" = "to")),
+#           color = "green", alpha = 0.5)
+# #987 nodes with incoming, complement of 518 leaf nodes from anti_join
+# intersect(y$to, z$idn) |> length()
+# #nodes are either duplicated from 2 incoming edges or NA for incoming
+# #so sum together the immediately upstream edge length where it exists
+# left_join(
+#   z, 
+#   y |>
+#     #count(to) |> arrange(desc(n))
+#     #arrange(to) |> #slice(45:55)
+#     summarise(in_length = sum(shape_length), .by = "to")
+#   ,
+#   by = c("idn" = "to") 
+#   )
 
+#associate the immediately upstream streamlength from edges to each 'to' node
+#summed over both upstream tribs
 lsfn <- lsfn |> 
-  tidygraph::activate(edges) |> 
+  tidygraph::activate(nodes) |> 
   left_join(
-    lsfn |> st_as_sf("nodes") |> as_tibble() |> select(-SHAPE)
+    select(as_tibble(as_tibble(lsfn, active = "edges")), uid, to, shape_length) |> 
+      summarise(in_length_first_order = sum(shape_length), .by = "to")
     ,
-    by = c("to" = "idn")
+    by = c("idn" = "to")
     )
 
+#ensure whole thing is directed acyclic to root
+tidygraph::with_graph(lsfn, tidygraph::graph_is_dag()) #true, good
 
-ggplot() + 
-  geom_sf(
-    data = lsfn |> st_as_sf("nodes") 
-    ,
-    color = "grey50", alpha = 0.5) +
-  geom_sf(
-    data = lsfn |> st_as_sf("edges") |> 
-      filter(d_to_root == 0)
-    , linewidth = 1.5, color = "orange"
+
+#sweet: https://tidygraph.data-imaginist.com/reference/map_local.html
+#this may not be the most efficient approach but...
+#maps over local neighborhood per node, summing firstorderinlength
+#no appreciable speed diff between order = 3,10,max
+lsfn_order <- tidygraph::with_graph(lsfn, tidygraph::graph_order())
+
+lsfn <- lsfn |> 
+  tidygraph::activate(nodes) |> 
+  mutate(
+    ## in_node = tidygraph::local_members(order = 3, mode = "in"),
+    ## in_node_chr = map_chr(in_node, ~paste(.x, collapse = ",")),
+    in_ft = tidygraph::map_local_dbl(
+      order = lsfn_order, mode = "in", 
+      .f = function(neighborhood, ...){
+        sum(as_tibble(neighborhood, active = 'nodes')$in_length_first_order, na.rm = T)
+        }
+      ),
+    in_km = 0.0003 * in_ft
   )
 
-ggplot() + 
-  #geom_sf(data = lsfn |> st_as_sf("edges"), aes(color = d_to_root)) + 
-  geom_sf(data = lsfn |> st_as_sf("edges"), aes(color = d_to_root_km)) + 
-  wacolors::scale_color_wa_c("sea_star")
 
 
 ## unused but keeping handy for now
@@ -216,38 +251,98 @@ ggplot() +
 #     tidygraph::to_linegraph
 #   ) |> 
 #   mutate(
-#     d_to_root = tidygraph::node_distance_to(tidygraph::node_is_root())
+#     d_root = tidygraph::node_distance_to(tidygraph::node_is_root())
 #   ) |> 
 #   tidygraph::unmorph() 
 
 ```
 
-Next - think about reverse travel time to get a cfs-unit value 'up'
+# perfuse a root value
 
-But really need to progress iteratively from network perimeter down?
+playing with reverse "contributing" + "travel time" to get a cfs-unit value 'up'
 
-```{r}
-#super dumb demo of 'spreading a fixed volume up network'?
-#decaying by d_km at ...power-law rate?
-#need to get a cumulative drainage area not just root distance
-#so for each node, get 'upstream' distance to furthest leaf
-#the diameter of the subgraph above a given node?
-#may also need to ensure directed to root?
-tidygraph::with_graph(lsfn, tidygraph::graph_is_dag()) #true, good
+the "in_km" built from topology and edge geometry length is proxy, not true 'drainage area', especially over very large domains or other (lithology, land cover) factors that cause adjoining subbasins to have very different drainage density/dissection.
 
-lsfn |> 
-  tidygraph::activate(nodes) |> 
+Need to progress iteratively from network perimeter down, at a multi-COMID scale?
+This first pass going to create big flow 'jumps' where mainstem catchments join?
+
+
+```{r dumb_instant_travel_perfuse}
+
+z <- as_tibble(lsfn, active = 'nodes')
+
+#z |> sf::st_zm() |> select(-in_node) |> mapview::mapview(zcol = "in_ft")
+
+#hot damn
+ggplot() +
+  geom_sf(data = as_tibble(lsfn, active = "edges"), color = "lightblue", linewidth = 0.5) +
+  geom_sf(data = z, aes(color = log10(in_ft)), alpha = 0.8) +
+  wacolors::scale_color_wa_b()
+
+#try for super dumb demo of 'spreading a fixed volume up network'?
+#good: decay is appropriately at power-law rate, 
+# so is this capturing nested/recursive/cumulative contribution more or less correctly?
+#bad/weird: this is showing a weird thing, unclear what it means in flow units
+# "if the flow at the outlet is 1000, then this is the independent portion contributed by each network position" 
+z |>
+  #as_tibble() |> 
+  arrange(desc(in_km)) |> 
   mutate(
-    # #this (unsurprisingly) does not work: 
-    # d_to_perim = tidygraph::node_distance_to(tidygraph::node_is_leaf())
-    # # neither this...
-    # d_to_perim = tidygraph::node_max_flow_from(tidygraph::node_is_leaf(), capacity = shape_length)
+    in_km_pct = in_km / sum(in_km),
+    q1k =  1000*in_km_pct,
+    q1k_log10 = log10(q1k)
+  ) |> 
+  #arrange(q1k) |> filter(!is.infinite(q1k_log10))
+  #pull(q1k) |> sum(na.rm = T)
+  ggplot() + 
+  geom_sf(data = st_as_sf(lsfn, "edges"), col = "lightblue", linewidth = 0.3) +
+  geom_sf(aes(color = q1k_log10)) + wacolors::scale_color_wa_b("ferries", reverse = T)
+
+
+#check summing upstream in subgraph
+#this is somewhat reassuring: the 'outlet' flow is scaling appropriately within-network
+lsfn <- lsfn |> 
+  tidygraph::activate("nodes") |> 
+  mutate(
+    in_km_pct = in_km / sum(in_km),
+    q1k =  1000*in_km_pct,
+    q1k_log10 = log10(q1k)
   )
 
-lsfn |> 
+z <- lsfn |> 
+  tidygraph::activate("nodes") |> 
   mutate(
-    1/d_to_root_km
+    q_recalc = tidygraph::map_local_dbl(
+      order = lsfn_order, mode = "in", 
+      .f = function(neighborhood, ...){
+        sum(as_tibble(neighborhood, active = 'nodes')$q1k, na.rm = T)
+        }
+      )
   )
+
+
+{
+as_tibble(z, active = 'nodes') |> #pull(q_recalc) |> summary()
+  ggplot() + 
+  geom_sf(data = st_as_sf(lsfn, "edges"), col = "lightblue", linewidth = 0.3) +
+  geom_sf(aes(color = q_recalc), size = 0.5) + 
+  wacolors::scale_color_wa_c("ferries", reverse = T) +
+  labs(
+    title = "Assuming instantaneous travel time, \n
+       if outlet flow is 1000 cfs/cms/etc, and independent network contributions are uniform, \n
+       then this is the (instant) value everywhere in the network, \n
+       with Q per node summed from upstream subgraph (in-neighborhood)
+    ")
+}+{
+as_tibble(z, active = 'nodes') |> 
+  ggplot() + 
+  geom_sf(data = st_as_sf(lsfn, "edges"), col = "lightblue", linewidth = 0.3) +
+  geom_sf(aes(color = log10(q_recalc)), size = 0.5) + 
+  wacolors::scale_color_wa_b("ferries", n.breaks = 6, reverse = T) +
+  labs(title = "same, log10 to show power law decay")
+} + plot_layout(ncol = 1)
+
+ggsave(filename = "f_ins_tt_unif_contrib_1k.png", width = 7, height = 11, dpi = 150)
 
 ```
 
