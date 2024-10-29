@@ -82,7 +82,7 @@ sf_nhdp_wa <- readRDS("~/T/DFW-Team WDFW Watershed Synthesis - flow_trees_heat/s
 ```
 
 ```{r lines_3dhp, eval=FALSE}
-sf::st_layers(file.path(dir_data_common, "3dhp/17110008_EDH_230605.gdb"))
+# sf::st_layers(file.path(dir_data_common, "3dhp/17110008_EDH_230605.gdb"))
 
 # #after initial read before select()
 # as_tibble(lines) |> #glimpse()
@@ -102,6 +102,155 @@ lines_3dhp <- sf::st_read(file.path(dir_data_common, "3dhp/17110008_EDH_230605.g
 #   ggplot() + geom_sf(aes(color = Source))
 
 ```
+
+cut nhdp to 3dhp & associate comid
+
+```{r sf_nhdp_wa_3dhp}
+sf_nhdp_wa_3dhp <- sf_nhdp_wa[st_as_sfc(st_bbox(lines_3dhp)),] #1464 of 57313
+
+#not bad, maybe ~1min?
+lines_3dhp <- st_join(
+  lines_3dhp,
+  sf_nhdp_wa_3dhp |> select(-state),
+  join = st_intersects, #st_crosses?
+  largest = T
+)
+
+```
+
+cut 3dhp to focal comid(s) & build network
+
+```{r lines_3dhp_to_lsfn}
+#where is the greatest density of 3dhp lines in NHDplus MR catchments?
+sf_nhdp_wa_3dhp |> 
+  left_join(
+    lines_3dhp |> as_tibble() |> count(comid, name = "n_3dhp") |> arrange(desc(n_3dhp))    
+    , by = "comid"
+  ) |> 
+  drop_na(n_3dhp) |> 
+  ggplot() + geom_sf(aes(color = n_3dhp, fill = n_3dhp)) + 
+  wacolors::scale_color_wa_c("sea", reverse = T, aesthetics = c("color","fill")) + 
+  labs(title = "Pilot 3DHP lines per med res NHDplus catchments")
+
+#for now just take the comid with the greatest number of associated 3dhp line units: "24275471"
+lines_3dhp |> as_tibble() |> count(comid, name = "n_3dhp") |> arrange(desc(n_3dhp)) |> slice(1:10)
+
+# #test if multilinestring is actually more than single line
+# #not, anywhere in the full set actually
+# any(map_int(st_geometry(filter(lines_3dhp, comid == "24275471")), length) > 1)
+# any(map_int(st_geometry(lines_3dhp), length) > 1)
+
+
+#create sfnetwork object with nodes and edges that have from/to attributes added...
+#identical feature count, follows from length(geometry()) test
+lsfn <- lines_3dhp |> 
+  filter(comid == "24275471") |> 
+  select(uid = UniqueID, shape_length = SHAPE_Length, comid) |> 
+  st_cast("LINESTRING") |> 
+  sfnetworks::as_sfnetwork()
+
+# #this 'rooted forest' has GIS artifact strays
+# ggplot() +
+#   geom_sf(data = st_as_sf(lsfn, "edges"), col = "lightblue", linewidth = 0.3) +
+#   geom_sf(
+#     data = lsfn |> 
+#       tidygraph::activate(nodes) |> 
+#       filter(tidygraph::node_is_root()) |> 
+#       st_as_sf("nodes")
+#     ,
+#     color = "orange"
+#   )
+
+#can likely pipe this directly into original object declaration
+#but for now allows qaqc of intermediates
+#adds a calc'd topological distance for nodes which then associated to 'to' of edges
+#appears that the ground distance versions are 'from downstream node to downstream [root] node'
+lsfn <- lsfn |>
+  tidygraph::activate(nodes) |> 
+  tidygraph::convert(
+    tidygraph::to_largest_component,
+    .clean = T #this drops the .tidygraph_node_index/edge_index that no longer apply & are potentially confusing
+  ) |> 
+  mutate(
+    idn = seq_along(SHAPE),
+    d_to_root = tidygraph::node_distance_to(tidygraph::node_is_root()),
+    d_to_root_ft = tidygraph::node_distance_to(tidygraph::node_is_root(), weights = shape_length),
+    d_to_root_km = 0.0003 * d_to_root_ft
+    ) 
+
+# #idn is 'to' of root edge == 892, edge uid should be 8004
+# #but idn != .tidygraph_node_index (created before the convert), 892 vs 900 for dtoroot0 
+# lsfn |> st_as_sf("edges") |> sf::st_zm() |> mapview::mapview()
+# lsfn |> st_as_sf("nodes") |> as_tibble() |> select(-SHAPE) |> arrange(d_to_root)
+
+lsfn <- lsfn |> 
+  tidygraph::activate(edges) |> 
+  left_join(
+    lsfn |> st_as_sf("nodes") |> as_tibble() |> select(-SHAPE)
+    ,
+    by = c("to" = "idn")
+    )
+
+
+ggplot() + 
+  geom_sf(
+    data = lsfn |> st_as_sf("nodes") 
+    ,
+    color = "grey50", alpha = 0.5) +
+  geom_sf(
+    data = lsfn |> st_as_sf("edges") |> 
+      filter(d_to_root == 0)
+    , linewidth = 1.5, color = "orange"
+  )
+
+ggplot() + 
+  #geom_sf(data = lsfn |> st_as_sf("edges"), aes(color = d_to_root)) + 
+  geom_sf(data = lsfn |> st_as_sf("edges"), aes(color = d_to_root_km)) + 
+  wacolors::scale_color_wa_c("sea_star")
+
+
+## unused but keeping handy for now
+## temporarily converting edges to nodes 
+# lsfn |> 
+#   tidygraph::morph(
+#     tidygraph::to_linegraph
+#   ) |> 
+#   mutate(
+#     d_to_root = tidygraph::node_distance_to(tidygraph::node_is_root())
+#   ) |> 
+#   tidygraph::unmorph() 
+
+```
+
+Next - think about reverse travel time to get a cfs-unit value 'up'
+
+But really need to progress iteratively from network perimeter down?
+
+```{r}
+#super dumb demo of 'spreading a fixed volume up network'?
+#decaying by d_km at ...power-law rate?
+#need to get a cumulative drainage area not just root distance
+#so for each node, get 'upstream' distance to furthest leaf
+#the diameter of the subgraph above a given node?
+#may also need to ensure directed to root?
+tidygraph::with_graph(lsfn, tidygraph::graph_is_dag()) #true, good
+
+lsfn |> 
+  tidygraph::activate(nodes) |> 
+  mutate(
+    # #this (unsurprisingly) does not work: 
+    # d_to_perim = tidygraph::node_distance_to(tidygraph::node_is_leaf())
+    # # neither this...
+    # d_to_perim = tidygraph::node_max_flow_from(tidygraph::node_is_leaf(), capacity = shape_length)
+  )
+
+lsfn |> 
+  mutate(
+    1/d_to_root_km
+  )
+
+```
+
 
 
 # Flow regime via NWM on 3DHP
@@ -571,30 +720,6 @@ for(i in seq_len(nrow(x))){
 ```
 
 ```{r nwm_on_3dhp}
-
-aoi <- st_as_sfc(st_bbox(lines_3dhp))
-sf_nhdp_wa_aoi <- sf_nhdp_wa[aoi,]
-ggplot() + geom_sf(data = sf_nhdp_wa_aoi, fill = NA) + geom_sf(data = aoi, color = "purple", fill = NA)
-
-#not bad, maybe ~1min?
-lines_3dhp <- st_join(
-  lines_3dhp,
-  sf_nhdp_wa_aoi |> select(-state),
-  join = st_intersects, #st_crosses?
-  largest = T
-)
-
-#where is the greatest density of 3dhp lines in NHDplus MR catchments?
-sf_nhdp_wa_aoi |> 
-  left_join(
-    lines_3dhp |> as_tibble() |> count(comid, name = "n_3dhp") |> arrange(desc(n_3dhp))    
-    , by = "comid"
-  ) |> 
-  drop_na(n_3dhp) |> 
-  ggplot() + geom_sf(aes(color = n_3dhp, fill = n_3dhp)) + 
-  wacolors::scale_color_wa_c("sea", reverse = T, aesthetics = c("color","fill")) + 
-  labs(title = "Pilot 3DHP lines per med res NHDplus catchments")
-
 
 #NWM 2022 testing values
 q_3dhp <- q |> 
