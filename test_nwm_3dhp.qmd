@@ -342,7 +342,7 @@ as_tibble(z, active = 'nodes') |>
   labs(title = "same, log10 to show power law decay")
 } + plot_layout(ncol = 1)
 
-ggsave(filename = "f_ins_tt_unif_contrib_1k.png", width = 7, height = 11, dpi = 150)
+ggsave(filename = "f_ins_tt_unif_contrib_1k.png", width = 7, height = 11, dpi = 150, bg = "white")
 
 ```
 
