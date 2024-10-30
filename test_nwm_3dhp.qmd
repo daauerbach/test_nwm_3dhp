@@ -28,6 +28,7 @@ theme_set(theme_minimal())
 dir_data_common <- "~/T/DFW-Team WDFW Watershed Synthesis - data_common"
 epsg <- 2927 #WA state standard; NAD83(HARN)/ft
 
+load("test_nwm_3dhp.RData")
 ```
 
 # objects
@@ -108,7 +109,7 @@ lines_3dhp <- sf::st_read(file.path(dir_data_common, "3dhp/17110008_EDH_230605.g
 
 cut nhdp to 3dhp & associate comid
 
-```{r sf_nhdp_wa_3dhp}
+```{r sf_nhdp_wa_3dhp, eval=FALSE}
 sf_nhdp_wa_3dhp <- sf_nhdp_wa[st_as_sfc(st_bbox(lines_3dhp)),] #1464 of 57313
 
 #not bad, maybe ~1min?
@@ -121,9 +122,9 @@ lines_3dhp <- st_join(
 
 ```
 
-cut 3dhp to focal comid(s) & build network
+cut 3dhp to focal comid(s) & build test network
 
-```{r lines_3dhp_to_lsfn}
+```{r lines_3dhp_to_lsfn, eval=FALSE}
 # #where is the greatest density of 3dhp lines in NHDplus MR catchments?
 # sf_nhdp_wa_3dhp |> 
 #   left_join(
@@ -162,10 +163,9 @@ cut 3dhp to focal comid(s) & build network
 #the convert to_largest_component drops GIS artifact strays from initial 'rooted forest'
 #then adds calc'd topological and length weighted distance for nodes which are then associated to 'to' of edges
 #map inspection that the ground distance versions are 'from downstream node to downstream [root] node'
-
 lsfn <- lines_3dhp |> 
   filter(comid == "24275471") |> 
-  select(uid = UniqueID, shape_length = SHAPE_Length, comid) |> 
+  select(uid = UniqueID, shape_length = SHAPE_Length, comid, desc = Desc) |> 
   st_cast("LINESTRING") |> 
   sfnetworks::as_sfnetwork() |> 
   tidygraph::activate(nodes) |> 
@@ -183,65 +183,60 @@ lsfn <- lines_3dhp |>
     in_n = tidygraph::local_size(order = nrow(tidygraph::.N()), mode = "in")
     ) 
 
-# ## !! leaving this scoping block for now but can delete on stable/cleanup
-# z <- select(as_tibble(as_tibble(lsfn, active = "nodes")), idn, d_root, in_n) #1505 nodes
-# y <- select(as_tibble(as_tibble(lsfn, active = "edges")), uid, to, from, shape_length) #1504 edges
-# #nodes with no 'to' in the edgelist are leaves
-# z[setdiff(z$idn, y$to),] |> filter(in_n > 1) 
-# ggplot() + 
-#   geom_sf(data = as_tibble(lsfn, active = "edges"), color = "lightblue", linewidth = 0.5) +
-#   geom_sf(data = as_tibble(lsfn, active = "nodes"), color = "grey50", alpha = 0.5) +
-#   geom_sf(data = as_tibble(lsfn, active = "nodes") |> anti_join(y, by = c("idn" = "to")),
-#           color = "green", alpha = 0.5)
-# #987 nodes with incoming, complement of 518 leaf nodes from anti_join
-# intersect(y$to, z$idn) |> length()
-# #nodes are either duplicated from 2 incoming edges or NA for incoming
-# #so sum together the immediately upstream edge length where it exists
-# left_join(
-#   z, 
-#   y |>
-#     #count(to) |> arrange(desc(n))
-#     #arrange(to) |> #slice(45:55)
-#     summarise(in_length = sum(shape_length), .by = "to")
-#   ,
-#   by = c("idn" = "to") 
-#   )
 
 #associate the immediately upstream streamlength from edges to each 'to' node
 #summed over both upstream tribs
+#also add 'below_culvert' logical:
+#   every culvert edge has a single 'to' node,
+#   but each of those 'to' nodes has potentially 2 incoming edges
+#   one of which may be a non-culvert
+#   and there is a potential case of 2 converging culverts
+#   so need logic to define per-node state in 
+#   {no-incoming, not, culvert, not+not, culvert+not, culvert+culvert}
 lsfn <- lsfn |> 
   tidygraph::activate(nodes) |> 
   left_join(
-    select(as_tibble(as_tibble(lsfn, active = "edges")), uid, to, shape_length) |> 
-      summarise(in_length_first_order = sum(shape_length), .by = "to")
-    ,
-    by = c("idn" = "to")
+    select(as_tibble(as_tibble(lsfn, active = "edges")), uid, idn = to, shape_length, desc) |> 
+      summarise(
+        below_culvert = if_else(any(str_detect(desc, "ulvert")), T, F),
+        in_ft_first_order = sum(shape_length),
+        .by = "idn"),
+    by = c("idn")
     )
 
 #ensure whole thing is directed acyclic to root
 tidygraph::with_graph(lsfn, tidygraph::graph_is_dag()) #true, good
 
-
+#now per-node, define upstream neighborhood and sum over first-order incoming lengths of neighborhood members
 #sweet: https://tidygraph.data-imaginist.com/reference/map_local.html
 #this may not be the most efficient approach but...
-#maps over local neighborhood per node, summing firstorderinlength
 #no appreciable speed diff between order = 3,10,max
 lsfn_order <- tidygraph::with_graph(lsfn, tidygraph::graph_order())
 
 lsfn <- lsfn |> 
   tidygraph::activate(nodes) |> 
   mutate(
-    ## in_node = tidygraph::local_members(order = 3, mode = "in"),
-    ## in_node_chr = map_chr(in_node, ~paste(.x, collapse = ",")),
     in_ft = tidygraph::map_local_dbl(
       order = lsfn_order, mode = "in", 
       .f = function(neighborhood, ...){
-        sum(as_tibble(neighborhood, active = 'nodes')$in_length_first_order, na.rm = T)
+        sum(as_tibble(neighborhood, active = 'nodes')$in_ft_first_order, na.rm = T)
         }
       ),
     in_km = 0.0003 * in_ft
   )
 
+
+#and then add node attributes back to edge by 'to'
+lsfn <- lsfn |> 
+  tidygraph::activate(edges) |> 
+  mutate(culvert = str_detect(desc, "ulvert")) |> 
+  left_join(
+    select(as_tibble(as_tibble(lsfn, active = "nodes")), to = idn, d_root, ends_with("_km")) 
+    ,
+    by = c("to")
+    ) |> 
+  tidygraph::activate(nodes)
+  
 
 
 ## unused but keeping handy for now
@@ -346,6 +341,58 @@ ggsave(filename = "f_ins_tt_unif_contrib_1k.png", width = 7, height = 11, dpi = 
 
 ```
 
+# be more smarter about gradient
+
+can haz per-reach slope?
+
+
+# what about desc==culvert (& vs fpb)
+
+"Connector: culvert" reaches (edges) in terms of the upstream network km
+
+```{r conn_culvert_upstream}
+as_tibble(lsfn, "edges") |> 
+  #as_tibble() |> count(desc)
+  #ggplot() + geom_sf(aes(color = desc)) + scale_color_manual(values = c("grey","orange","lightblue"))
+  ggplot() + geom_sf(aes(color = culvert)) + scale_color_manual(values = c("lightblue","orange"))
+
+as_tibble(lsfn, active = "nodes") |> ggplot() + geom_sf(aes(color = below_culvert))
+
+as_tibble(lsfn, "edges") |> st_zm() |> mapview::mapview(zcol = "culvert", burst = T)
+
+
+#as_tibble(lsfn, "edges") |> ggplot() + geom_sf(aes(color = d_root_km))
+
+ggplot() +
+  geom_sf(data = as_tibble(lsfn, "edges") |> filter(!culvert), linewidth = 0.2, color = "lightblue") +
+  geom_sf(data = as_tibble(lsfn, "nodes") |> filter(below_culvert), aes(color = in_km, size = in_km)) + 
+  scale_color_gradient(low = "white", high = "purple") + scale_size_area(max_size = 4) +
+  theme(line = element_blank(), axis.text = element_blank()) +
+  ggspatial::annotation_scale(location = "bl")
+
+ggplot() +
+  geom_sf(data = as_tibble(lsfn, "edges") |> filter(!culvert), linewidth = 0.2, color = "lightblue") +
+  geom_sf(data = as_tibble(lsfn, "nodes") |> filter(below_culvert),
+          #aes(color = in_km, size = 1 / d_root_km)) + 
+          aes(size = in_km, color = 1 / d_root_km)) + 
+  #scale_color_gradient(low = "tan", high = "purple") + 
+  wacolors::scale_color_wa_b("puget", n.breaks = 8, reverse = T) + 
+  scale_size_area(max_size = 5) +
+  theme(line = element_blank(), axis.text = element_blank()) +
+  ggspatial::annotation_scale(location = "bl")
+
+
+# lsfn |>
+#   mutate(
+#     ac = tidygraph::centrality_alpha()
+#   ) |> filter(in_n != ac)
+
+```
+
+
+fit for 'prob of being a real culvert'?
+
+split the basin, train on fpb matches, test/validate in remaining?
 
 
 # Flow regime via NWM on 3DHP
