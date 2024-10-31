@@ -36,4 +36,6 @@ Alternative ideas to explore, in some sort of vaguely increasing order of comple
   - D: “Nested ensembling (? No idea what to call this)” - something else entirely. it’s likely to be difficult to train any other class of model on observed flows (GAM, hierarchical Bayesian, deep learning, whatever), because of the lack of training data (i.e., multiple surface flow time series at a sub-NHDplus catchment scale), but maybe use a statistical ‘bridge’ model trained on a higher resolution process model
     - not a first priority 
 
-2024-10-29 mvp of approach A ![](f_ins_tt_unif_contrib_1k.png)
+2024-10-29 mvp of approach A
+
+<img src="https://github.com/daauerbach/test_nwm_3dhp/blob/main/figures/f_ins_tt_unif_contrib_1k.png" height="900">

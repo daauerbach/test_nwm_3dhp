@@ -252,6 +252,82 @@ lsfn <- lsfn |>
 
 ```
 
+```{r func_prep_sfn}
+#little wrapper to pull out 3dhp for a given catchment
+#then make into attributed sfnetwork
+#follow above flow in chunk lines_3dhp_to_lsfn
+prep_sfn <- function(cat){
+  l <- lines_3dhp |> 
+    filter(comid == cat) |> 
+    select(uid = UniqueID, shape_length = SHAPE_Length, comid, desc = Desc) |> 
+    sf::st_cast("LINESTRING") |>
+    sfnetworks::as_sfnetwork() |>
+    tidygraph::activate(nodes) |>
+    tidygraph::convert(
+      tidygraph::to_largest_component,
+      .clean = T #this drops the .tidygraph_node_index/edge_index that no longer apply & are potentially confusing
+    ) |>
+    mutate(
+      idn = seq_along(SHAPE),
+      #raindrop perspective paths from nodes to root
+      d_root = tidygraph::node_distance_to(tidygraph::node_is_root()),
+      d_root_ft = tidygraph::node_distance_to(tidygraph::node_is_root(), weights = shape_length),
+      d_root_km = 0.0003 * d_root_ft,
+      #looking 'up' perspective to perimeter from per-node 'me'
+      in_n = tidygraph::local_size(order = nrow(tidygraph::.N()), mode = "in")
+    )
+
+  #ensure whole thing is directed acyclic to root
+  if(!tidygraph::with_graph(l, tidygraph::graph_is_dag())) {stop();print("Not DAG")}
+
+  #associate the immediately upstream streamlength from edges to each 'to' node
+  #summed over both upstream tribs; also add 'below_culvert' logical:
+  # defining per-node state in {no-incoming, not, culvert, not+not, culvert+not, culvert+culvert}
+  l <- l |>
+    tidygraph::activate(nodes) |>
+    left_join(
+      select(as_tibble(as_tibble(l, active = "edges")), uid, idn = to, shape_length, desc) |>
+        summarise(
+          below_culvert = if_else(any(str_detect(desc, "ulvert")), T, F),
+          in_ft_first_order = sum(shape_length),
+          .by = "idn"),
+      by = c("idn")
+    )
+
+  #now per-node, define upstream neighborhood and sum over first-order incoming lengths of neighborhood members
+  l_order <- tidygraph::with_graph(l, tidygraph::graph_order())
+  
+  l <- l |>
+    tidygraph::activate(nodes) |>
+    mutate(
+      in_ft = tidygraph::map_local_dbl(
+        order = l_order, mode = "in",
+        .f = function(neighborhood, ...){
+          sum(as_tibble(neighborhood, active = 'nodes')$in_ft_first_order, na.rm = T)
+        }
+      ),
+      in_km = 0.0003 * in_ft
+    )
+
+  #and then add node attributes back to edge by 'to'
+  l <- l |>
+    tidygraph::activate(edges) |>
+    mutate(culvert = str_detect(desc, "ulvert")) |>
+    left_join(
+      select(as_tibble(as_tibble(l, active = "nodes")), to = idn, d_root, ends_with("_km"))
+      ,
+      by = c("to")
+    ) |>
+    tidygraph::activate(nodes)
+  
+  return(l)
+}
+
+
+lsfn <- prep_sfn("24275471")
+```
+
+
 # perfuse a root value
 
 playing with reverse "contributing" + "travel time" to get a cfs-unit value 'up'
@@ -337,7 +413,7 @@ as_tibble(z, active = 'nodes') |>
   labs(title = "same, log10 to show power law decay")
 } + plot_layout(ncol = 1)
 
-ggsave(filename = "f_ins_tt_unif_contrib_1k.png", width = 7, height = 11, dpi = 150, bg = "white")
+ggsave(filename = "figures/f_ins_tt_unif_contrib_1k.png", width = 7, height = 11, dpi = 150, bg = "white")
 
 ```
 
@@ -350,37 +426,40 @@ can haz per-reach slope?
 
 "Connector: culvert" reaches (edges) in terms of the upstream network km
 
-```{r conn_culvert_upstream}
-as_tibble(lsfn, "edges") |> 
-  #as_tibble() |> count(desc)
-  #ggplot() + geom_sf(aes(color = desc)) + scale_color_manual(values = c("grey","orange","lightblue"))
-  ggplot() + geom_sf(aes(color = culvert)) + scale_color_manual(values = c("lightblue","orange"))
+```{r func_gg_culv}
+#conn_culvert_upstream
 
-as_tibble(lsfn, active = "nodes") |> ggplot() + geom_sf(aes(color = below_culvert))
+# as_tibble(lsfn, "edges") |> 
+#   #as_tibble() |> count(desc)
+#   #ggplot() + geom_sf(aes(color = desc)) + scale_color_manual(values = c("grey","orange","lightblue"))
+#   ggplot() + geom_sf(aes(color = culvert)) + scale_color_manual(values = c("lightblue","orange"))
+# 
+# as_tibble(lsfn, active = "nodes") |> ggplot() + geom_sf(aes(color = below_culvert))
+# 
+# as_tibble(lsfn, "edges") |> st_zm() |> mapview::mapview(zcol = "culvert", burst = T)
 
-as_tibble(lsfn, "edges") |> st_zm() |> mapview::mapview(zcol = "culvert", burst = T)
+# ggplot() +
+#   geom_sf(data = as_tibble(lsfn, "edges") |> filter(!culvert), linewidth = 0.2, color = "lightblue") +
+#   geom_sf(data = as_tibble(lsfn, "nodes") |> filter(below_culvert), aes(color = in_km, size = in_km)) + 
+#   scale_color_gradient(low = "white", high = "purple") + scale_size_area(max_size = 4) +
+#   theme(line = element_blank(), axis.text = element_blank()) +
+#   ggspatial::annotation_scale(location = "bl")
 
+gg_culv <- function(){
+  ggplot() +
+    geom_sf(data = as_tibble(lsfn, "edges") |> filter(!culvert), linewidth = 0.2, color = "lightblue") +
+    geom_sf(data = as_tibble(lsfn, "nodes") |> filter(below_culvert),
+            #aes(color = in_km, size = 1 / d_root_km)) + 
+            aes(size = in_km, color = 1 / d_root_km)) + 
+    #scale_color_gradient(low = "tan", high = "purple") + 
+    wacolors::scale_color_wa_b("puget", n.breaks = 8, reverse = T) + 
+    scale_size_area(max_size = 5) +
+    theme(line = element_blank(), axis.text = element_blank()) +
+    ggspatial::annotation_scale(location = "bl") +
+    labs(subtitle = paste("3DHP for NHD comid", as_tibble(lsfn, "edges")$comid[1]))
+}
 
-#as_tibble(lsfn, "edges") |> ggplot() + geom_sf(aes(color = d_root_km))
-
-ggplot() +
-  geom_sf(data = as_tibble(lsfn, "edges") |> filter(!culvert), linewidth = 0.2, color = "lightblue") +
-  geom_sf(data = as_tibble(lsfn, "nodes") |> filter(below_culvert), aes(color = in_km, size = in_km)) + 
-  scale_color_gradient(low = "white", high = "purple") + scale_size_area(max_size = 4) +
-  theme(line = element_blank(), axis.text = element_blank()) +
-  ggspatial::annotation_scale(location = "bl")
-
-ggplot() +
-  geom_sf(data = as_tibble(lsfn, "edges") |> filter(!culvert), linewidth = 0.2, color = "lightblue") +
-  geom_sf(data = as_tibble(lsfn, "nodes") |> filter(below_culvert),
-          #aes(color = in_km, size = 1 / d_root_km)) + 
-          aes(size = in_km, color = 1 / d_root_km)) + 
-  #scale_color_gradient(low = "tan", high = "purple") + 
-  wacolors::scale_color_wa_b("puget", n.breaks = 8, reverse = T) + 
-  scale_size_area(max_size = 5) +
-  theme(line = element_blank(), axis.text = element_blank()) +
-  ggspatial::annotation_scale(location = "bl")
-
+#gg_culv()
 
 # lsfn |>
 #   mutate(
@@ -423,6 +502,7 @@ sf_fpb <- sf::read_sf(
 #cut FPDSI subset down to 3dhp
 sf_fpb_3dhp <- sf_fpb[st_as_sfc(st_bbox(lines_3dhp)),]
 
+
 ```
 
 much more to think about doing with `LinealGainMeasurement`, `SignificantReachCode`, etc.
@@ -442,10 +522,8 @@ sf_nhdp_wa_3dhp_fpb <- sf_nhdp_wa_3dhp |>
     by = "comid"
   )
 
-lines_3dhp_u <- lines_3dhp |> st_union() 
-lines_3dhp_uch <- lines_3dhp_u |> 
-  st_convex_hull()
 
+lines_3dhp_uch <- lines_3dhp |> st_union() |> st_convex_hull()
 
 {ggplot() + geom_sf(data = sf_nhdp_wa_3dhp_fpb, aes(fill = yes), color = NA) + 
     geom_sf(data = lines_3dhp_uch, fill = NA, color = "hotpink") +
@@ -458,8 +536,149 @@ lines_3dhp_uch <- lines_3dhp_u |>
 
 ```
 
+```{r eda}
+sf_fpb_3dhp |> ggplot() + geom_sf(aes(shape = fish_use, color = fish_use)) + geom_sf(data = lines_3dhp_uch, fill = NA, color = "hotpink")
+
+#first couple cats not in 3dhp, train on 24275405 32+5
+sf_nhdp_wa_3dhp_fpb[lines_3dhp_uch,] |> arrange(desc(yes+no))
+
+fcat <- "24275405"
+lsfn <- prep_sfn(fcat)
+#can should instead reverse join poly comid on point...
+lsfn_fpb <- sf_fpb_3dhp[filter(sf_nhdp_wa_3dhp_fpb, comid == fcat),]
+
+gg_culv() +
+  geom_sf(
+    data = lsfn_fpb, aes(shape = fish_use), 
+    color = "grey30", alpha = 0.5) + scale_shape_manual(values = c(3,4))
+
+mapview::mapview(st_zm(as_tibble(lsfn, "edges")), zcol = "culvert", burst = T, color = c("lightblue","hotpink")) +
+  mapview::mapview(lsfn_fpb, zcol = "fish_use", burst = T)
+
+#compare field assessed slope for a match: uid 65142
+#https://apps.wdfw.wa.gov/fishpassagephotos/Reports/LP27_Report.pdf
+#slope 1.03%
+
+#remotes::install_github("ropensci/slopes")
+#from slope_matrix workhorse help "The output value is a proportion representing the change in elevation for a given change in horizontal movement along the linestring. 0.02, for example, represents a low gradient of 2% while 0.08 represents a steep gradient of 8%."
+
+z <- as_tibble(lsfn, "edges") |> filter(uid == "65142")
+
+slopes::z_value(z)
+slopes::slope_xyz(z, directed = T)
+#need to confirm that in reaches/edges 
+#first point is upstream/max
+#last point is downstream/min
+z |> mutate(
+  across(SHAPE, list(
+    zslope_est = ~slopes::slope_xyz(., directed = T),
+    z1 = ~slopes::z_start(.),
+    z2 = ~slopes::z_end(.),
+    #zmin = ~slopes::z_min(.), #bug, calls max(), issue created
+    zmin = ~min(slopes::z_value(.)), 
+    zmax = ~slopes::z_max(.)
+  ))
+) |> select(uid, contains("z"))
+
+#cannot get to scatter against FPDSI slope without different version of those data (not going to review individual level A reports)
+#but can still start to look at (mis)match...
+#inflections at ~20ft buffer distance 
+tibble(d = seq(0, 50, by = 2)) |> 
+  mutate(
+    n_intsct = d |> 
+      map_int(
+        #st_intersection(
+        ~st_intersects(
+          as_tibble(lsfn, "edges") |> filter(culvert),
+          lsfn_fpb |> st_buffer(dist = .x)
+        ) |> unlist() |> length()
+      )
+  ) |> 
+  ggplot() + geom_col(aes(d, n_intsct))
+
+d_buff <- 20
+
+#if just inner_join wanted can use st_intersection
+#but this preserves non-matches as NA
+z <- st_join(
+  as_tibble(lsfn, "edges") |> filter(culvert),
+  lsfn_fpb |> st_buffer(dist = d_buff)
+  ) |> 
+  mutate(
+    across(SHAPE, list(
+      zslope_est = ~slopes::slope_xyz(., directed = T),
+      zmax = ~slopes::z_max(.)
+      ), .names = "{.fn}")
+  )
+
+z |> 
+  ggplot(aes(fish_use, zslope_est)) +
+  geom_jitter(width = 0.2, alpha = 0.6) +
+  geom_violin(fill = NA)
+
+#full set? (FAST!?!)
+sf_3dhp_culv_fpb <- st_join(
+  lines_3dhp |> 
+    filter(str_detect(Desc, "ulvert")) |> 
+    sf::st_cast("LINESTRING") 
+  ,
+  sf_fpb_3dhp |> st_buffer(dist = d_buff)
+  ) |> 
+  mutate(
+    across(SHAPE, list(
+      zslope_est = ~slopes::slope_xyz(., directed = T),
+      zmax = ~slopes::z_max(.)
+      ), .names = "{.fn}")
+  ) |> 
+  select(
+    uid = UniqueID, shape_length = SHAPE_Length, comid, desc = Desc,
+    SiteId, FeatureType, fish_use, FishUseCriteriaCode, FPBarrierStatusCode, FPBarrierReasonCode, PercentFishPassableCode, SurveyDate,
+    zslope_est, zmax
+    )
+
+sf_3dhp_culv_fpb |> #summary()
+  filter(zslope_est <= 0) |>  #drop a single edge with a positive slope (assume this is artifact)
+  ggplot(aes(fish_use, zslope_est)) +
+  geom_jitter(width = 0.2, alpha = 0.6) +
+  geom_violin(fill = NA)
+
+#plot coerced to centroid point for better vis
+#462/8794 (minus 1 positive slope weirdo)
+{
+ggplot() +
+  geom_sf(
+    data = sf_3dhp_culv_fpb |>
+      filter(is.na(SiteId), zslope_est <= 0) |>
+      st_centroid(),
+    aes(color = zslope_est), shape = 18, alpha = 0.6
+    ) + 
+    wacolors::scale_color_wa_c("foothills") +
+    labs(subtitle = "8,332 3DHP without (20ft buffer) barrier matches")
+}+{
+ggplot() +
+  geom_sf(
+    data = sf_3dhp_culv_fpb |>
+      drop_na(SiteId) |> 
+      filter(zslope_est <= 0) |>  #drop a single edge with a positive slope (assume this is artifact)
+      st_centroid(),
+    aes(color = zslope_est, shape = fish_use), alpha = 0.6
+    ) +
+  wacolors::scale_color_wa_c("foothills") +
+  scale_shape_manual(values = c(19,10,15)) +
+    labs(subtitle = "462 3DHP with (20ft buffer) barrier matches")
+} + 
+  plot_layout(ncol = 1) +
+  plot_annotation(
+    title = "Estimated slopes for 3DHP 'connector: culvert' reaches vs fish passage barrier inventory culverts",
+    subtitle = "Approx. ~5% of 3DHP 'connector: culvert' (462 of 8794) with barrier matches")
+
+ggsave(filename = "figures/f_culv_slope_compare.png", width = 7, height = 11, dpi = 150, bg = "white")
+
+```
 
 # Flow regime via NWM on 3DHP
+
+come back to examine relative to: https://gis.dnr.wa.gov/site2/rest/services/Public_Forest_Practices/WADNR_PUBLIC_FP_Water_Type/MapServer
 
 ```{r nwm_zarr_pull3, eval=FALSE}
 #revised from flow_trees_apps.qmd, which built per-year rds objects into data_common/nmw_retro, moved into /v2_1
