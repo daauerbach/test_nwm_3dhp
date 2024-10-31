@@ -394,6 +394,70 @@ fit for 'prob of being a real culvert'?
 
 split the basin, train on fpb matches, test/validate in remaining?
 
+```{r sf_fpb}
+sf_fpb <- sf::read_sf(
+  file.path(dir_data_common,"WdfwFishPassage.gdb"), 
+  layer = "WDFW_FishPassageSite") |> 
+  sf::st_transform(epsg) |> 
+  rename_with(.cols = starts_with("FishPassage"), .fn = ~str_replace(., "FishPassage","FP")) |> 
+  filter(
+    FPFeatureTypeCode==1 #culverts
+    # #!is.na(BarrierCorrectionTypeCode)
+    # !is.na(BarrierCorrectionYearsText)
+  ) |> 
+  mutate(
+    fish_use = case_when(
+      FishUseCode == 10 ~ "yes",
+      FishUseCode == 20 ~ "no",
+      FishUseCode == 99 ~ "unk"
+    )
+  ) |> 
+  left_join(
+    tibble(
+      OwnerTypeCode = c(1:7,9,10,12), 
+      owner = c("city", "county", "federal", "private", "state", "tribal", "other", "drainage_dist", "diking_dist", "unk")
+    ),
+    by = "OwnerTypeCode"
+  )
+
+#cut FPDSI subset down to 3dhp
+sf_fpb_3dhp <- sf_fpb[st_as_sfc(st_bbox(lines_3dhp)),]
+
+```
+
+much more to think about doing with `LinealGainMeasurement`, `SignificantReachCode`, etc.
+
+```{r sf_nhdp_wa_3dhp_fpb}
+#as_tibble(sf_fpb_3dhp) |> count(fish_use)
+
+#add a basic barrier attribute count to NHDcats
+sf_nhdp_wa_3dhp_fpb <- sf_nhdp_wa_3dhp |> 
+  select(-state) |> 
+  left_join(
+    st_join(sf_fpb_3dhp, sf_nhdp_wa_3dhp) |> #pt in poly, not expanding
+      as_tibble() |> 
+      count(comid, fish_use) |> 
+      pivot_wider(names_from = fish_use, values_from = n)
+    ,
+    by = "comid"
+  )
+
+lines_3dhp_u <- lines_3dhp |> st_union() 
+lines_3dhp_uch <- lines_3dhp_u |> 
+  st_convex_hull()
+
+
+{ggplot() + geom_sf(data = sf_nhdp_wa_3dhp_fpb, aes(fill = yes), color = NA) + 
+    geom_sf(data = lines_3dhp_uch, fill = NA, color = "hotpink") +
+    wacolors::scale_fill_wa_c("forest_fire", na.value = "grey90")
+  }+{ggplot() + geom_sf(data = sf_nhdp_wa_3dhp_fpb, aes(fill = no), color = NA) + 
+      geom_sf(data = lines_3dhp_uch, fill = NA, color = "hotpink") +
+      wacolors::scale_fill_wa_c("ferries", na.value = "grey90")} +
+  plot_layout(ncol = 1) + 
+  plot_annotation(subtitle = "Fish passage barriers per 1:100NHDplus catchment by 'fish use' \n pink hull shows 3DHP extent")
+
+```
+
 
 # Flow regime via NWM on 3DHP
 
