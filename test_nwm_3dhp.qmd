@@ -499,16 +499,21 @@ sf_fpb <- sf::read_sf(
     by = "OwnerTypeCode"
   )
 
-#cut FPDSI subset down to 3dhp
-sf_fpb_3dhp <- sf_fpb[st_as_sfc(st_bbox(lines_3dhp)),]
-
-
 ```
 
 much more to think about doing with `LinealGainMeasurement`, `SignificantReachCode`, etc.
 
 ```{r sf_nhdp_wa_3dhp_fpb}
+#slightly tighter than bbox
+lines_3dhp_uch <- lines_3dhp |> st_union() |> st_convex_hull()
+
+#cut FPDSI subset down to 3dhp
+#sf_fpb_3dhp <- sf_fpb[st_as_sfc(st_bbox(lines_3dhp)),] #this is 2221
+sf_fpb_3dhp <- sf_fpb[lines_3dhp_uch,] #1374
+
 #as_tibble(sf_fpb_3dhp) |> count(fish_use)
+
+sf_fpb_3dhp |> ggplot() + geom_sf(aes(shape = fish_use, color = fish_use)) + geom_sf(data = lines_3dhp_uch, fill = NA, color = "hotpink")
 
 #add a basic barrier attribute count to NHDcats
 sf_nhdp_wa_3dhp_fpb <- sf_nhdp_wa_3dhp |> 
@@ -523,8 +528,6 @@ sf_nhdp_wa_3dhp_fpb <- sf_nhdp_wa_3dhp |>
   )
 
 
-lines_3dhp_uch <- lines_3dhp |> st_union() |> st_convex_hull()
-
 {ggplot() + geom_sf(data = sf_nhdp_wa_3dhp_fpb, aes(fill = yes), color = NA) + 
     geom_sf(data = lines_3dhp_uch, fill = NA, color = "hotpink") +
     wacolors::scale_fill_wa_c("forest_fire", na.value = "grey90")
@@ -537,8 +540,6 @@ lines_3dhp_uch <- lines_3dhp |> st_union() |> st_convex_hull()
 ```
 
 ```{r eda}
-sf_fpb_3dhp |> ggplot() + geom_sf(aes(shape = fish_use, color = fish_use)) + geom_sf(data = lines_3dhp_uch, fill = NA, color = "hotpink")
-
 #first couple cats not in 3dhp, train on 24275405 32+5
 sf_nhdp_wa_3dhp_fpb[lines_3dhp_uch,] |> arrange(desc(yes+no))
 
@@ -559,62 +560,62 @@ mapview::mapview(st_zm(as_tibble(lsfn, "edges")), zcol = "culvert", burst = T, c
 #https://apps.wdfw.wa.gov/fishpassagephotos/Reports/LP27_Report.pdf
 #slope 1.03%
 
-#remotes::install_github("ropensci/slopes")
-#from slope_matrix workhorse help "The output value is a proportion representing the change in elevation for a given change in horizontal movement along the linestring. 0.02, for example, represents a low gradient of 2% while 0.08 represents a steep gradient of 8%."
 
-z <- as_tibble(lsfn, "edges") |> filter(uid == "65142")
-
-slopes::z_value(z)
-slopes::slope_xyz(z, directed = T)
-#need to confirm that in reaches/edges 
-#first point is upstream/max
-#last point is downstream/min
-z |> mutate(
-  across(SHAPE, list(
-    zslope_est = ~slopes::slope_xyz(., directed = T),
-    z1 = ~slopes::z_start(.),
-    z2 = ~slopes::z_end(.),
-    #zmin = ~slopes::z_min(.), #bug, calls max(), issue created
-    zmin = ~min(slopes::z_value(.)), 
-    zmax = ~slopes::z_max(.)
-  ))
-) |> select(uid, contains("z"))
-
-#cannot get to scatter against FPDSI slope without different version of those data (not going to review individual level A reports)
-#but can still start to look at (mis)match...
-#inflections at ~20ft buffer distance 
-tibble(d = seq(0, 50, by = 2)) |> 
-  mutate(
-    n_intsct = d |> 
-      map_int(
-        #st_intersection(
-        ~st_intersects(
-          as_tibble(lsfn, "edges") |> filter(culvert),
-          lsfn_fpb |> st_buffer(dist = .x)
-        ) |> unlist() |> length()
-      )
-  ) |> 
-  ggplot() + geom_col(aes(d, n_intsct))
-
-d_buff <- 20
-
-#if just inner_join wanted can use st_intersection
-#but this preserves non-matches as NA
-z <- st_join(
-  as_tibble(lsfn, "edges") |> filter(culvert),
-  lsfn_fpb |> st_buffer(dist = d_buff)
-  ) |> 
-  mutate(
-    across(SHAPE, list(
-      zslope_est = ~slopes::slope_xyz(., directed = T),
-      zmax = ~slopes::z_max(.)
-      ), .names = "{.fn}")
-  )
-
-z |> 
-  ggplot(aes(fish_use, zslope_est)) +
-  geom_jitter(width = 0.2, alpha = 0.6) +
-  geom_violin(fill = NA)
+# #remotes::install_github("ropensci/slopes")
+# #from slope_matrix workhorse help "The output value is a proportion representing the change in elevation for a given change in horizontal movement along the linestring. 0.02, for example, represents a low gradient of 2% while 0.08 represents a steep gradient of 8%."
+# z <- as_tibble(lsfn, "edges") |> filter(uid == "65142")
+# 
+# slopes::z_value(z)
+# slopes::slope_xyz(z, directed = T)
+# #need to confirm that in reaches/edges 
+# #first point is upstream/max
+# #last point is downstream/min
+# z |> mutate(
+#   across(SHAPE, list(
+#     zslope_est = ~slopes::slope_xyz(., directed = T),
+#     z1 = ~slopes::z_start(.),
+#     z2 = ~slopes::z_end(.),
+#     #zmin = ~slopes::z_min(.), #bug, calls max(), issue created
+#     zmin = ~min(slopes::z_value(.)), 
+#     zmax = ~slopes::z_max(.)
+#   ))
+# ) |> select(uid, contains("z"))
+# 
+# #cannot get to scatter against FPDSI slope without different version of those data (not going to review individual level A reports)
+# #but can still start to look at (mis)match...
+# #inflections at ~20ft buffer distance 
+# tibble(d = seq(0, 50, by = 2)) |> 
+#   mutate(
+#     n_intsct = d |> 
+#       map_int(
+#         #st_intersection(
+#         ~st_intersects(
+#           as_tibble(lsfn, "edges") |> filter(culvert),
+#           lsfn_fpb |> st_buffer(dist = .x)
+#         ) |> unlist() |> length()
+#       )
+#   ) |> 
+#   ggplot() + geom_col(aes(d, n_intsct))
+# 
+# d_buff <- 20
+# 
+# #if just inner_join wanted can use st_intersection
+# #but this preserves non-matches as NA
+# z <- st_join(
+#   as_tibble(lsfn, "edges") |> filter(culvert),
+#   lsfn_fpb |> st_buffer(dist = d_buff)
+#   ) |> 
+#   mutate(
+#     across(SHAPE, list(
+#       zslope_est = ~slopes::slope_xyz(., directed = T),
+#       zmax = ~slopes::z_max(.)
+#       ), .names = "{.fn}")
+#   )
+# 
+# z |> 
+#   ggplot(aes(fish_use, zslope_est)) +
+#   geom_jitter(width = 0.2, alpha = 0.6) +
+#   geom_violin(fill = NA)
 
 #full set? (FAST!?!)
 sf_3dhp_culv_fpb <- st_join(
@@ -643,36 +644,51 @@ sf_3dhp_culv_fpb |> #summary()
   geom_violin(fill = NA)
 
 #plot coerced to centroid point for better vis
-#462/8794 (minus 1 positive slope weirdo)
 {
 ggplot() +
   geom_sf(
     data = sf_3dhp_culv_fpb |>
-      filter(is.na(SiteId), zslope_est <= 0) |>
+      filter(is.na(SiteId), zslope_est <= 0) |> #nrow()
       st_centroid(),
     aes(color = zslope_est), shape = 18, alpha = 0.6
     ) + 
     wacolors::scale_color_wa_c("foothills") +
-    labs(subtitle = "8,332 3DHP without (20ft buffer) barrier matches")
+    labs(subtitle = "8,332 3DHP without (20ft buffer) matches to fish passage inventory culverts")
 }+{
 ggplot() +
   geom_sf(
     data = sf_3dhp_culv_fpb |>
       drop_na(SiteId) |> 
-      filter(zslope_est <= 0) |>  #drop a single edge with a positive slope (assume this is artifact)
+      filter(zslope_est <= 0) |> #nrow() #drop a single edge with a positive slope (assume this is artifact)
       st_centroid(),
     aes(color = zslope_est, shape = fish_use), alpha = 0.6
     ) +
   wacolors::scale_color_wa_c("foothills") +
   scale_shape_manual(values = c(19,10,15)) +
-    labs(subtitle = "462 3DHP with (20ft buffer) barrier matches")
-} + 
+    labs(subtitle = "462 3DHP with (20ft buffer) matches")
+} + {
+  ggplot() +
+    geom_sf(
+      data = sf_fpb_3dhp |> 
+        #semi_join(as_tibble(sf_3dhp_culv_fpb), by = "SiteId")
+        anti_join(as_tibble(sf_3dhp_culv_fpb), by = "SiteId")
+      ,
+      aes(shape = fish_use), alpha = 0.6
+    ) +
+    scale_shape_manual(values = c(19,10,15)) +
+    labs(subtitle = "915 fish passage inventory culverts without 3DHP barrier matches")
+} +
   plot_layout(ncol = 1) +
   plot_annotation(
-    title = "Estimated slopes for 3DHP 'connector: culvert' reaches vs fish passage barrier inventory culverts",
+    title = "Estimated slopes for 3DHP 'connector: culvert' reaches vs fish passage inventory culverts",
     subtitle = "Approx. ~5% of 3DHP 'connector: culvert' (462 of 8794) with barrier matches")
 
 ggsave(filename = "figures/f_culv_slope_compare.png", width = 7, height = 11, dpi = 150, bg = "white")
+
+
+#redo distances from all fpb to any/culvert 3dhp lines
+
+#examine survey date/source for nonmatches/far distances
 
 ```
 
