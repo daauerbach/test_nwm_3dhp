@@ -779,6 +779,53 @@ SSNbler::ssn_assemble(
 ```
 
 
+# examine Brinkerhoff et al. 2024
+
+```{r first_look}
+#from https://apps.nationalmap.gov/downloader/ via e.g. 'https://prd-tnm.s3.amazonaws.com/StagedProducts/Hydrography/NHDPlusHR/VPU/Current/GDB/NHDPLUS_H_1703_HU4_GDB.zip'
+
+#1708 is Lwr Col; IMW basins are evident in HUC12s
+st_read(file.path(dir_data_common, "nhdphr/17/NHDPLUS_H_1708_HU4_GDB.gdb/"), layer = "WBDHU12") |> ggplot() + geom_sf()
+
+#1703 Yakima
+#1708 Lwr Col, ~200K lines
+#1711 Puget Sound, ~300K lines 
+sf_nhdphr_h12 <- st_read(file.path(dir_data_common, "nhdphr/17/NHDPLUS_H_1711_HU4_GDB.gdb/"), layer = "WBDHU12")
+
+sf_nhdphr_flw <- st_read(file.path(dir_data_common, "nhdphr/17/NHDPLUS_H_1711_HU4_GDB.gdb/"), layer = "NHDFlowline")
+
+brnk_est <- read_csv(file.path(dir_data_common, "nhdphr/brinkerhoffetal2024_results_archive/results_1711.csv"))
+
+#cut down to Deschutes R
+aoi <- sf_nhdphr_h12 |> 
+  #as_tibble() |> 
+  filter(States == "WA") |> 
+  select(HUC12, Name, AreaSqKm) |> 
+  #filter(str_detect(Name, "Still"))
+  filter(str_detect(Name, "Deschut")) #|> mapview::mapview()
+
+aoi_flw <- sf_nhdphr_flw |> 
+  #as_tibble() |> #glimpse()
+  mutate(h8 = str_sub(ReachCode, 1, 8)) |> 
+  filter(h8 == unique(str_sub(aoi$HUC12, 1,8))) |> 
+  st_cast("LINESTRING") |> 
+  left_join(
+    brnk_est, by = "NHDPlusID"
+  )
+
+# 'percQEph_reach'
+
+aoi_flw |> 
+  as_tibble() |> 
+  ggplot() + geom_boxplot(aes(perenniality, percQEph_reach), varwidth = T, outliers = F)
+
+mapview::mapview(aoi) +
+  mapview::mapview(aoi_flw, zcol = "percQEph_reach") 
+
+
+```
+
+
 # Flow regime via NWM on 3DHP
 
 come back to examine relative to: https://gis.dnr.wa.gov/site2/rest/services/Public_Forest_Practices/WADNR_PUBLIC_FP_Water_Type/MapServer
