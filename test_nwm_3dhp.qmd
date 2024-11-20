@@ -33,55 +33,6 @@ load("test_nwm_3dhp.RData")
 
 # objects
 
-```{r sf_fpb, eval=FALSE}
-sf_fpb <- sf::read_sf(
-  file.path(dir_data_common,"WdfwFishPassage.gdb"), 
-  layer = "WDFW_FishPassageSite") |> 
-  sf::st_transform(epsg) |> 
-  rename_with(.cols = starts_with("FishPassage"), .fn = ~str_replace(., "FishPassage","FP")) |> 
-  filter(
-    FPFeatureTypeCode==1 #culverts
-    # #!is.na(BarrierCorrectionTypeCode)
-    # !is.na(BarrierCorrectionYearsText)
-  ) |> 
-  mutate(
-    fish_use = case_when(
-      FishUseCode == 10 ~ "yes",
-      FishUseCode == 20 ~ "no",
-      FishUseCode == 99 ~ "unk"
-    )
-  ) |> 
-  left_join(
-    tibble(
-      OwnerTypeCode = c(1:7,9,10,12), 
-      owner = c("city", "county", "federal", "private", "state", "tribal", "other", "drainage_dist", "diking_dist", "unk")
-    ),
-    by = "OwnerTypeCode"
-  )
-```
-
-```{r sf_nhdp_wa, eval=FALSE}
-# #med res NHDplus, 230K polys including non-WA, no attrib but FEATUREID==COMID for StreamCat join
-# sf_nhdp <- sf::read_sf(file.path(dir_data_common, "NHDPlus17/NHDPlusCatchment/Catchment.shp")) |>
-#   sf::st_transform(crs = sf::st_crs(epsg)) |>
-#   select(COMID = FEATUREID, areasqkm = AreaSqKM)
-# 
-# #use StreamCat for WA to nonspatially subset catchment polys
-# sf_nhdp_wa <- inner_join(
-#   sf_nhdp |> mutate(comid = as.character(COMID))
-#   ,
-#   StreamCatTools::sc_nlcd(state = "WA", year = "2019", aoi = 'riparian_watershed') |>
-#     rename_with(tolower) |> as_tibble() |>
-#     mutate(comid = as.character(comid)) |> 
-#     select(comid, state)
-#   ,
-#   by = "comid")
-# 
-# saveRDS(sf_nhdp_wa, "~/T/DFW-Team WDFW Watershed Synthesis - flow_trees_heat/sf_nhdp_wa.rds")
-
-sf_nhdp_wa <- readRDS("~/T/DFW-Team WDFW Watershed Synthesis - flow_trees_heat/sf_nhdp_wa.rds")
-```
-
 ```{r lines_3dhp, eval=FALSE}
 # sf::st_layers(file.path(dir_data_common, "3dhp/17110008_EDH_230605.gdb"))
 
@@ -112,12 +63,12 @@ lines_3dhp <- sf::st_read(file.path(dir_data_common, "3dhp/17110008_EDH_230605.g
 
 ```
 
-```{r add_slope_est}
+```{r add_slope_est_convex_hull, eval=FALSE}
 lines_3dhp <- lines_3dhp |> 
   mutate(
     across(SHAPE, list(
       zslope_est = ~slopes::slope_xyz(., directed = T),
-      zmax = ~slopes::z_max(.)
+      zmax = ~map_dbl(., ~slopes::z_max(.x))
       ), .names = "{.fn}")
   )
 
@@ -125,12 +76,38 @@ lines_3dhp <- lines_3dhp |>
 #   st_centroid() |> 
 #   ggplot() + geom_sf(aes(color = zslope_est), size = 0.5, alpha = 0.5) + wacolors::scale_color_wa_c("forest_fire")
 
+#slightly tighter than bbox
+lines_3dhp_uch <- lines_3dhp |> st_union() |> st_convex_hull()
+
 ```
 
 cut nhdp to 3dhp & associate comid
 
+```{r sf_nhdp_wa, eval=FALSE}
+# #med res NHDplus, 230K polys including non-WA, no attrib but FEATUREID==COMID for StreamCat join
+# sf_nhdp <- sf::read_sf(file.path(dir_data_common, "NHDPlus17/NHDPlusCatchment/Catchment.shp")) |>
+#   sf::st_transform(crs = sf::st_crs(epsg)) |>
+#   select(COMID = FEATUREID, areasqkm = AreaSqKM)
+# 
+# #use StreamCat for WA to nonspatially subset catchment polys
+# sf_nhdp_wa <- inner_join(
+#   sf_nhdp |> mutate(comid = as.character(COMID))
+#   ,
+#   StreamCatTools::sc_nlcd(state = "WA", year = "2019", aoi = 'riparian_watershed') |>
+#     rename_with(tolower) |> as_tibble() |>
+#     mutate(comid = as.character(comid)) |> 
+#     select(comid, state)
+#   ,
+#   by = "comid")
+# 
+# saveRDS(sf_nhdp_wa, "~/T/DFW-Team WDFW Watershed Synthesis - flow_trees_heat/sf_nhdp_wa.rds")
+
+sf_nhdp_wa <- readRDS("~/T/DFW-Team WDFW Watershed Synthesis - flow_trees_heat/sf_nhdp_wa.rds")
+```
+
 ```{r sf_nhdp_wa_3dhp, eval=FALSE}
-sf_nhdp_wa_3dhp <- sf_nhdp_wa[st_as_sfc(st_bbox(lines_3dhp)),] #1464 of 57313
+#sf_nhdp_wa_3dhp <- sf_nhdp_wa[st_as_sfc(st_bbox(lines_3dhp)),] #1464 of 57313
+sf_nhdp_wa_3dhp <- sf_nhdp_wa[lines_3dhp_uch,] #959
 
 #not bad, maybe ~1min?
 lines_3dhp <- st_join(
@@ -141,6 +118,91 @@ lines_3dhp <- st_join(
 )
 
 ```
+
+cut FPDSI culvert subset down to 3dhp
+
+```{r sf_fpb, eval=FALSE}
+#also: tbl(con_fpdsi, "SiteFishPassageViewSpatial") for current but need to revisit permissions for full schema
+
+sf_fpb <- sf::read_sf(
+  file.path(dir_data_common,"WdfwFishPassage.gdb"), 
+  layer = "WDFW_FishPassageSite") |> 
+  sf::st_transform(epsg) |> 
+  rename_with(.cols = starts_with("FishPassage"), .fn = ~str_replace(., "FishPassage","FP")) |> 
+  filter(
+    FPFeatureTypeCode==1 #culverts
+    # #!is.na(BarrierCorrectionTypeCode)
+    # !is.na(BarrierCorrectionYearsText)
+  ) |> 
+  mutate(
+    fish_use = case_when(
+      FishUseCode == 10 ~ "yes",
+      FishUseCode == 20 ~ "no",
+      FishUseCode == 99 ~ "unk"
+    )
+  ) |> 
+  left_join(
+    tibble(
+      OwnerTypeCode = c(1:7,9,10,12), 
+      owner = c("city", "county", "federal", "private", "state", "tribal", "other", "drainage_dist", "diking_dist", "unk")
+    ),
+    by = "OwnerTypeCode"
+  )
+
+```
+
+```{r sf_fpb_3dhp, eval=FALSE}
+#sf_fpb_3dhp <- sf_fpb[st_as_sfc(st_bbox(lines_3dhp)),] #this is 2221
+sf_fpb_3dhp <- sf_fpb[lines_3dhp_uch,] #1374
+
+#as_tibble(sf_fpb_3dhp) |> count(fish_use)
+#sf_fpb_3dhp |> ggplot() + geom_sf(aes(shape = fish_use, color = fish_use)) + geom_sf(data = lines_3dhp_uch, fill = NA, color = "hotpink")
+
+```
+
+add a basic barrier attribute count to NHDcats
+
+```{r sf_nhdp_wa_3dhp_fpb, eval=FALSE}
+sf_nhdp_wa_3dhp_fpb <- sf_nhdp_wa_3dhp |> 
+  select(-state) |> 
+  left_join(
+    st_join(sf_fpb_3dhp, sf_nhdp_wa_3dhp) |> #pt in poly, not expanding
+      as_tibble() |> 
+      count(comid, fish_use) |> 
+      pivot_wider(names_from = fish_use, values_from = n)
+    ,
+    by = "comid"
+  )
+
+# {ggplot() + geom_sf(data = sf_nhdp_wa_3dhp_fpb, aes(fill = yes), color = NA) + 
+#     geom_sf(data = lines_3dhp_uch, fill = NA, color = "hotpink") +
+#     wacolors::scale_fill_wa_c("forest_fire", na.value = "grey90")
+#   }+{ggplot() + geom_sf(data = sf_nhdp_wa_3dhp_fpb, aes(fill = no), color = NA) + 
+#       geom_sf(data = lines_3dhp_uch, fill = NA, color = "hotpink") +
+#       wacolors::scale_fill_wa_c("ferries", na.value = "grey90")} +
+#   plot_layout(ncol = 1) + 
+#   plot_annotation(subtitle = "Fish passage barriers per 1:100NHDplus catchment by 'fish use' \n pink hull shows 3DHP extent")
+
+```
+
+trim NHDplusHighRes down to 3DHP general extent (convex hull of unioned lines) 
+
+```{r sf_nhdphr_flw_3dhp, eval=FALSE}
+sf_nhdphr_flw_3dhp <- st_read(file.path(dir_data_common, "nhdphr/17/NHDPLUS_H_1711_HU4_GDB.gdb/"), layer = "NHDFlowline") |> 
+  select(Permanent_Identifier, GNIS_Name:ReachCode, FCode, Shape_Length, NHDPlusID) |> 
+  st_cast("LINESTRING") |> 
+  left_join(
+    read_csv(file.path(dir_data_common, "nhdphr/brinkerhoffetal2024_results_archive/results_1711.csv"))
+    ,
+    by = "NHDPlusID") |> 
+  drop_na(percQEph_reach) |> 
+  st_zm() |> 
+  st_transform(st_crs(lines_3dhp))
+
+sf_nhdphr_flw_3dhp <- sf_nhdphr_flw_3dhp[lines_3dhp_uch,] #23785
+
+```
+
 
 cut 3dhp to focal comid(s) & build test network
 
@@ -485,42 +547,6 @@ gg_culv <- function(){
 
 ```
 
-```{r sf_nhdp_wa_3dhp_fpb}
-#slightly tighter than bbox
-lines_3dhp_uch <- lines_3dhp |> st_union() |> st_convex_hull()
-
-#cut FPDSI subset down to 3dhp
-#sf_fpb_3dhp <- sf_fpb[st_as_sfc(st_bbox(lines_3dhp)),] #this is 2221
-sf_fpb_3dhp <- sf_fpb[lines_3dhp_uch,] #1374
-
-#as_tibble(sf_fpb_3dhp) |> count(fish_use)
-
-sf_fpb_3dhp |> ggplot() + geom_sf(aes(shape = fish_use, color = fish_use)) + geom_sf(data = lines_3dhp_uch, fill = NA, color = "hotpink")
-
-#add a basic barrier attribute count to NHDcats
-sf_nhdp_wa_3dhp_fpb <- sf_nhdp_wa_3dhp |> 
-  select(-state) |> 
-  left_join(
-    st_join(sf_fpb_3dhp, sf_nhdp_wa_3dhp) |> #pt in poly, not expanding
-      as_tibble() |> 
-      count(comid, fish_use) |> 
-      pivot_wider(names_from = fish_use, values_from = n)
-    ,
-    by = "comid"
-  )
-
-
-{ggplot() + geom_sf(data = sf_nhdp_wa_3dhp_fpb, aes(fill = yes), color = NA) + 
-    geom_sf(data = lines_3dhp_uch, fill = NA, color = "hotpink") +
-    wacolors::scale_fill_wa_c("forest_fire", na.value = "grey90")
-  }+{ggplot() + geom_sf(data = sf_nhdp_wa_3dhp_fpb, aes(fill = no), color = NA) + 
-      geom_sf(data = lines_3dhp_uch, fill = NA, color = "hotpink") +
-      wacolors::scale_fill_wa_c("ferries", na.value = "grey90")} +
-  plot_layout(ncol = 1) + 
-  plot_annotation(subtitle = "Fish passage barriers per 1:100NHDplus catchment by 'fish use' \n pink hull shows 3DHP extent")
-
-```
-
 ```{r culv_eda}
 #first couple cats not in 3dhp, train on 24275405 32+5
 sf_nhdp_wa_3dhp_fpb[lines_3dhp_uch,] |> arrange(desc(yes+no))
@@ -714,6 +740,18 @@ sf_fpb_3dhp |>
 
 ```
 
+```{r}
+lines_3dhp_culv <- lines_3dhp |> 
+    filter(str_detect(Desc, "ulvert")) 
+
+as_tibble(lines_3dhp_culv) |> #summary()
+  rename(length = SHAPE_Length) |> 
+  ggplot() + 
+  geom_point(aes(length, zmax, color = abs(zslope_est)), alpha = 0.3) +
+
+```
+
+
 fit for 'prob of being a real culvert'?
 
 split the basin, train on fpb matches, test/validate in remaining?
@@ -722,7 +760,226 @@ much more to think about doing with `LinealGainMeasurement`, `SignificantReachCo
 
 run version of climate adapted, given slope and some DA/contributing channel length regression on width?
 
+
+# examine Brinkerhoff et al. 2024
+
+```{r first_look}
+#from https://apps.nationalmap.gov/downloader/ via e.g. 'https://prd-tnm.s3.amazonaws.com/StagedProducts/Hydrography/NHDPlusHR/VPU/Current/GDB/NHDPLUS_H_1703_HU4_GDB.zip'
+
+#1708 is Lwr Col; IMW basins are evident in HUC12s
+st_read(file.path(dir_data_common, "nhdphr/17/NHDPLUS_H_1708_HU4_GDB.gdb/"), layer = "WBDHU12") |> ggplot() + geom_sf()
+
+#1703 Yakima
+#1708 Lwr Col, ~200K lines
+#1711 Puget Sound, ~300K lines 
+st_layers(file.path(dir_data_common, "nhdphr/17/NHDPLUS_H_1711_HU4_GDB.gdb/"))
+sf_nhdphr_h12 <- st_read(file.path(dir_data_common, "nhdphr/17/NHDPLUS_H_1711_HU4_GDB.gdb/"), layer = "WBDHU12")
+sf_nhdphr_h10 <- st_read(file.path(dir_data_common, "nhdphr/17/NHDPLUS_H_1711_HU4_GDB.gdb/"), layer = "WBDHU10")
+sf_nhdphr_h08 <- st_read(file.path(dir_data_common, "nhdphr/17/NHDPLUS_H_1711_HU4_GDB.gdb/"), layer = "WBDHU8")
+
+sf_nhdphr_flw <- st_read(file.path(dir_data_common, "nhdphr/17/NHDPLUS_H_1711_HU4_GDB.gdb/"), layer = "NHDFlowline") |> 
+  left_join(
+    read_csv(file.path(dir_data_common, "nhdphr/brinkerhoffetal2024_results_archive/results_1711.csv"))
+    ,
+    by = "NHDPlusID") |> 
+  drop_na(percQEph_reach)  
+
+# # drop_na based on check of object without it
+# # ~9.5k flowlines missing percent ephemeral 
+# # mostly shorelines/canals etc.
+# sf_nhdphr_flw |> filter(is.na(percQEph_reach)) |> ggplot() + geom_sf()
+
+#cut down to Deschutes R
+aoi <- sf_nhdphr_h12 |> 
+  #as_tibble() |> 
+  filter(States == "WA") |> 
+  select(HUC12, Name, AreaSqKm) |> 
+  #filter(str_detect(Name, "Still"))
+  filter(str_detect(Name, "Deschut")) #|> mapview::mapview()
+
+aoi_flw <- sf_nhdphr_flw |> 
+  #as_tibble() |> #glimpse()
+  mutate(h8 = str_sub(ReachCode, 1, 8)) |> 
+  filter(h8 == unique(str_sub(aoi$HUC12, 1,8))) |> 
+  st_cast("LINESTRING") 
+
+# 'percQEph_reach'
+
+aoi_flw |> 
+  as_tibble() |> 
+  ggplot() + geom_boxplot(aes(perenniality, percQEph_reach), varwidth = T, outliers = F)
+
+mapview::mapview(aoi) +
+  mapview::mapview(aoi_flw, zcol = "percQEph_reach") 
+
+#as suggested in paper & supp, examining median at smaller spatial scale
+#drives towards bimodality
+sf_nhdphr_h08 |> 
+  left_join(
+    sf_nhdphr_flw |> 
+      as_tibble() |>  
+      mutate(HUC8 = str_sub(ReachCode, 1, 8)) |> #distinct(HUC8) #21, matches poly count
+      summarise(
+        across(percQEph_reach, list(median = ~median(., na.rm = T))),
+        .by = HUC8
+      ) #|> print(n= Inf)
+    , by = "HUC8"
+  ) |> 
+  ggplot() + geom_sf(aes(fill = percQEph_reach_median)) + wacolors::scale_fill_wa_c()
+
+#to vis at H10 or H12 seems need to do spatial join...
+#117 in polys but 40 derived from ReachCode and only 19 in common
+inner_join(
+  as_tibble(sf_nhdphr_h10) |> distinct(HUC10) |> arrange()
+  ,
+  as_tibble(sf_nhdphr_flw) |> mutate(HUC10 = str_sub(ReachCode, 1, 10)) |> distinct(HUC10) |> arrange()
+  , by = "HUC10")
+
+#the ~2.3K 'huc12' values derived from ReachCode line up poorly with the ~511 in the HUC12 poly
+#only 87 in common; whatever the first 12 positions are, they're not the 'normal' HUC12
+inner_join(
+  as_tibble(sf_nhdphr_h12) |> distinct(HUC12)
+  ,
+  as_tibble(sf_nhdphr_flw) |> mutate(HUC12 = str_sub(ReachCode, 1, 12)) |> distinct(HUC12)
+  , by = "HUC12")
+
+
+#table of major rivers' percent ephemeral?
+#also have NHDPlusFlowlineVAA
+erom <- st_read(file.path(dir_data_common, "nhdphr/17/NHDPLUS_H_1711_HU4_GDB.gdb/"), layer = "NHDPlusEROMMA")
+glimpse(erom)
+
+#is this a fascinating plot? 
+#suggests that below an average QAMA about ~1 unit, systems are either mostly E or not (bimodal 1/0)  
+#but that the larger systems are 'well-blended'
+#i think this is implied if not directly stated in the paper w/some of the remarks on the 'scale of assessment' and the choice of HUC4 
+sf_nhdphr_flw |> 
+  as_tibble() |>  
+  drop_na(GNIS_Name) |> #down to ~51k 'named' flowlines
+  #count(GNIS_Name) |> arrange(desc(n)) #1700 named reaches
+  left_join(erom |> select(NHDPlusID, QAMA), by = "NHDPlusID") |> 
+  summarise(
+    across(
+      c(QAMA, percQEph_reach), 
+      list(median = ~median(., na.rm = T))),
+    .by = "GNIS_Name"
+  ) |> 
+  arrange(desc(QAMA_median)) |> 
+  #print(n= Inf)  
+  ggplot() + 
+  geom_point(aes(QAMA_median, percQEph_reach_median), size = 0.5, alpha = 0.5) +
+  scale_x_log10()
+
+
+sf_nhdphr_flw |> 
+  #as_tibble() |> 
+  select(GNIS_Name, NHDPlusID, perenniality, percQEph_reach) |> 
+  drop_na(GNIS_Name) |> #down to ~51k 'named' flowlines
+  left_join(erom |> select(NHDPlusID, QAMA), by = "NHDPlusID") |> 
+  #pull(QAMA) |> plot.ecdf(); abline(v = 100)
+  #filter(QAMA > 100) |> #100 is ~12.2K lines 
+  filter(QAMA > 50) |> #100 is ~17.2K lines 
+  # summarise(
+  #   across(
+  #     c(QAMA, percQEph_reach), 
+  #     list(median = ~median(., na.rm = T))),
+  #   .by = "GNIS_Name"
+  # ) |> 
+  # ggplot() + geom_point(aes(QAMA_median, percQEph_reach_median), size = 0.5, alpha = 0.5) + scale_x_log10()
+  #slice_max(QAMA, n = 1, by = GNIS_Name) |> 
+  ggplot() +
+  geom_sf(data = sf_nhdphr_h10, fill = NA) +
+  #geom_sf(aes(color = percQEph_reach)) + wacolors::scale_color_wa_c("vantage")
+  geom_sf(aes(color = percQEph_reach, linewidth = log10(QAMA))) + wacolors::scale_color_wa_c("vantage")
+
+```
+
+```{r sf_dnr_hydro}
+#1.3m features
+sf_dnr_hydro <- st_read(file.path(dir_data_common, "wadnr_state_hydro/wchydro.gdb"), layer = "wchydro")
+
+# sf_dnr_hydro[st_as_sfc(st_bbox(lines_3dhp)),] #31.4k
+sf_dnr_hydro_3dhp <- sf_dnr_hydro[lines_3dhp_uch,] #23.9k
+
+```
+
+```{r nhdphr_dnr}
+#NHDplus med res catchment for big jim creek, used above in default call to prep_sfn
+sf_cat <- filter(sf_nhdp_wa_3dhp_fpb, comid == "24275471")
+
+
+# list(
+#   nhdphr = sf_nhdphr_flw_3dhp[sf_cat,] |> select(GNIS_Name, LengthKM, perenniality, percQEph_reach)  
+#   ,
+#   dnr = sf_dnr_hydro_3dhp[sf_cat,]
+#   ,
+#   `3dhp` = as_tibble(lsfn, "edges") |> st_zm()
+# ) |> 
+#   mapview::mapview(
+#     zcol = list("perenniality", "WC_PERIOD_LABEL_NM", "desc"),
+#     burst = T,
+#     color = list("blue","green", "orange")
+#     )
+
+
+mapview::mapview(
+  sf_nhdphr_flw_3dhp[sf_cat,] |> select(GNIS_Name, LengthKM, perenniality, percQEph_reach)
+  ,
+  zcol = "perenniality", burst = T, color = c("lightblue","darkblue") #ephemeral, non-ephem
+  ) +
+mapview::mapview(
+  sf_dnr_hydro_3dhp[sf_cat,]
+  ,
+  zcol = "WC_PERIOD_LABEL_NM", burst = T, color = c("#831285","#C886E8") #Perennial, unknown
+) +
+mapview::mapview(
+  as_tibble(lsfn, "edges") |> st_zm()
+  ,
+  zcol = "desc", burst = T, color = c("yellow","orange","#386276")
+)
+
+
+# #not yet run  
+# sf_nhdphr_dnr <- st_join(
+#   sf_nhdphr_flw_3dhp[sf_cat,] |> select(GNIS_Name, LengthKM, perenniality, percQEph_reach)  
+#   ,
+#   sf_dnr_hydro_3dhp[sf_cat,]
+#   ,
+#   join = st_intersects, 
+#   left = T, #F for inner_
+#   largest = T
+#   )
+
+
+union_3dhp <- st_zm(as_tibble(lsfn, "edges")) |> st_union()
+union_dnr <- sf_dnr_hydro_3dhp[sf_cat,] |> st_union()
+union_diff <- st_difference(
+  union_3dhp,
+  union_dnr |> st_buffer(dist = 30)
+)
+
+union_3dhp |> #163km
+ union_dnr |> #54.7km
+ union_diff |> #123km outside 30ft buffer
+  st_length() |> units::set_units("km") |> as.numeric()
+
+
+{ ggplot() +  geom_sf(data = union_dnr, color = "gold") + labs(title = "DNR Hydrography") } +
+{ ggplot() + geom_sf(data = union_3dhp, color = "lightblue") + labs(title = "3DHP flowlines")} +
+{
+ggplot() +
+  geom_sf(data = union_3dhp, color = "darkgreen") +
+  geom_sf(data = union_diff, color = "lightblue") +
+  labs(title = "Intersection (green) and difference (blue) between \n 3DHP flowlines and a 30ft buffer on DNR Hydro")
+} + 
+  plot_layout(ncol = 1)
+
+
+```
+
 # testing SSNbler & SSN2
+
+next thing here is modeling APPS, perhaps conditioning on HRCD?
 
 ```{r compare_ssnbler_vs_lsfn}
 
@@ -746,7 +1003,8 @@ ssn$edges <-SSNbler::lines_to_lsn(
 ssn$edges <- SSNbler::updist_edges(
   ssn$edges,
   lsn_path = path_ssn,
-  calc_length = T
+  #calc_length = T
+  length_col = "shape_length"
 )
 
 ssn$edges #looks to match d_root_ft at least to reasonable precision
@@ -775,53 +1033,6 @@ SSNbler::ssn_assemble(
   lsn_path = path_ssn,
   
 )
-
-```
-
-
-# examine Brinkerhoff et al. 2024
-
-```{r first_look}
-#from https://apps.nationalmap.gov/downloader/ via e.g. 'https://prd-tnm.s3.amazonaws.com/StagedProducts/Hydrography/NHDPlusHR/VPU/Current/GDB/NHDPLUS_H_1703_HU4_GDB.zip'
-
-#1708 is Lwr Col; IMW basins are evident in HUC12s
-st_read(file.path(dir_data_common, "nhdphr/17/NHDPLUS_H_1708_HU4_GDB.gdb/"), layer = "WBDHU12") |> ggplot() + geom_sf()
-
-#1703 Yakima
-#1708 Lwr Col, ~200K lines
-#1711 Puget Sound, ~300K lines 
-sf_nhdphr_h12 <- st_read(file.path(dir_data_common, "nhdphr/17/NHDPLUS_H_1711_HU4_GDB.gdb/"), layer = "WBDHU12")
-
-sf_nhdphr_flw <- st_read(file.path(dir_data_common, "nhdphr/17/NHDPLUS_H_1711_HU4_GDB.gdb/"), layer = "NHDFlowline")
-
-brnk_est <- read_csv(file.path(dir_data_common, "nhdphr/brinkerhoffetal2024_results_archive/results_1711.csv"))
-
-#cut down to Deschutes R
-aoi <- sf_nhdphr_h12 |> 
-  #as_tibble() |> 
-  filter(States == "WA") |> 
-  select(HUC12, Name, AreaSqKm) |> 
-  #filter(str_detect(Name, "Still"))
-  filter(str_detect(Name, "Deschut")) #|> mapview::mapview()
-
-aoi_flw <- sf_nhdphr_flw |> 
-  #as_tibble() |> #glimpse()
-  mutate(h8 = str_sub(ReachCode, 1, 8)) |> 
-  filter(h8 == unique(str_sub(aoi$HUC12, 1,8))) |> 
-  st_cast("LINESTRING") |> 
-  left_join(
-    brnk_est, by = "NHDPlusID"
-  )
-
-# 'percQEph_reach'
-
-aoi_flw |> 
-  as_tibble() |> 
-  ggplot() + geom_boxplot(aes(perenniality, percQEph_reach), varwidth = T, outliers = F)
-
-mapview::mapview(aoi) +
-  mapview::mapview(aoi_flw, zcol = "percQEph_reach") 
-
 
 ```
 
