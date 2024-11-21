@@ -63,6 +63,8 @@ lines_3dhp <- sf::st_read(file.path(dir_data_common, "3dhp/17110008_EDH_230605.g
 
 ```
 
+could add custom function to `slope_xyz` to calc max gradient along reach rather than length-weighted default
+
 ```{r add_slope_est_convex_hull, eval=FALSE}
 lines_3dhp <- lines_3dhp |> 
   mutate(
@@ -740,7 +742,8 @@ sf_fpb_3dhp |>
 
 ```
 
-```{r}
+
+```{r needs_work}
 lines_3dhp_culv <- lines_3dhp |> 
     filter(str_detect(Desc, "ulvert")) 
 
@@ -748,6 +751,283 @@ as_tibble(lines_3dhp_culv) |> #summary()
   rename(length = SHAPE_Length) |> 
   ggplot() + 
   geom_point(aes(length, zmax, color = abs(zslope_est)), alpha = 0.3) +
+  scale_x_log10() + scale_y_log10()
+
+#try the whole thing
+#goal would be to supplement above ordination of culvert reaches by elevation and slope with up/downstream network distances
+
+#pretty fast, "directed acyclic multigraph with 22 components"
+lines_3dhp_sfn <- lines_3dhp |> 
+  sfnetworks::as_sfnetwork() 
+
+lines_3dhp_sfn <- lines_3dhp_sfn |>
+  tidygraph::activate(nodes) |>
+  mutate(ng = tidygraph::group_components())
+#non-primary components appear appropriately peripheral?
+as_tibble(lines_3dhp_sfn, "nodes") |> 
+  #as_tibble() |> count(ng) |> arrange(desc(n)) |> print(n=Inf)
+  filter(ng > 1) |> mutate(ng = letters[ng]) |>
+  #ggplot() + geom_sf(aes(color = ng))
+  st_zm() |> mapview::mapview(zcol = "ng", burst = T)
+
+#this results in 'directed acyclic multigraph with 1 component'
+lines_3dhp_sfn <- lines_3dhp_sfn |> 
+  tidygraph::convert(
+    tidygraph::to_largest_component,
+    .clean = T
+  ) 
+#need to reduce (multiedges) to tree to calc node_distance_to
+tidygraph::with_graph(lines_3dhp_sfn, tidygraph::graph_is_tree())
+# #have tidygraph option and sfnetwork extension, latter seems preferable for control on 'attribute_summary' arg
+# #but other tidygraph 'to_*_tree' options 
+# lines_3dhp_sfn |> tidygraph::convert(tidygraph::to_simple)
+lines_3dhp_sfn <- lines_3dhp_sfn |> tidygraph::convert(sfnetworks::to_spatial_simple, .clean = T)
+
+#also have https://luukvdmeer.github.io/sfnetworks/reference/simplify_network.html
+#but looks like needs package update? sfnetworks::simplify_network(lines_3dhp_sfn)
+
+#but still not a tree
+tidygraph::with_graph(lines_3dhp_sfn, tidygraph::graph_is_tree()) 
+tidygraph::with_graph(lines_3dhp_sfn, tidygraph::node_is_root()) |> any() 
+lines_3dhp_sfn |> filter(tidygraph::node_is_root())
+
+#may need to work with dominator tree? https://tidygraph.data-imaginist.com/reference/node_topology.html
+#however, there is an edge with a lowest elevation Z-val...
+as_tibble(lines_3dhp_sfn, "edges") |> as_tibble() |> arrange(zmax) 
+#the 'to' node is 73095 and/but it has no 'from'
+as_tibble(lines_3dhp_sfn, "edges") |> filter(from == 73095)
+#looks like maybe still some 'extra' edges? lsfn has 1 more node than edges, this has 41
+lines_3dhp_sfn |> 
+  tidygraph::activate("nodes") |> 
+  mutate(idn = seq_along(SHAPE)) |> 
+  arrange(tidygraph::node_topo_order())
+#okay so a small number of 'from' nodes appear twice, likely the issue?
+as_tibble(lines_3dhp_sfn, "edges") |> as_tibble() |> 
+  #count(to) |> arrange(desc(n)) |> count(n) #all either 1 or 2
+  count(from) |> arrange(desc(n)) |> 
+  #count(n)
+  filter(n > 1)
+#yes, have same node going to 2 different other nodes
+#and have a split path
+bind_rows(
+  as_tibble(lines_3dhp_sfn, "edges") |> filter(from == 27590)
+  ,
+  as_tibble(lines_3dhp_sfn, "edges") |> filter(to == 27590)
+  ,
+  as_tibble(lines_3dhp_sfn, "edges") |> filter(from == 25192), 
+  as_tibble(lines_3dhp_sfn, "edges") |> filter(from == 13639),
+  as_tibble(lines_3dhp_sfn, "edges") |> filter(from == 8703),
+  as_tibble(lines_3dhp_sfn, "edges") |> filter(from == 8704)
+  ,
+  as_tibble(lines_3dhp_sfn, "edges") |> filter(from == 28273)
+) |> 
+  select(-COMID) |> st_zm() |> mapview::mapview()
+
+#there are non-junction 'in-line' nodes - indeed, many are 'connector: culvert'
+#which explains the count(to) n==1
+bind_rows(
+  as_tibble(lines_3dhp_sfn, "edges") |> filter(to == 1)
+  ,
+  as_tibble(lines_3dhp_sfn, "edges") |> filter(from == 1)
+  ,
+  as_tibble(lines_3dhp_sfn, "edges") |> filter(to == 341),
+  as_tibble(lines_3dhp_sfn, "edges") |> filter(to == 340) #from is 25530, which appears to be leaf
+  #no rows/edges: as_tibble(lines_3dhp_sfn, "edges") |> filter(to == 25530)
+) |> 
+  select(-COMID) |> st_zm() |> mapview::mapview()
+
+#for each of the nodes with multiple 'from' drop one of the split paths?
+as_tibble(lines_3dhp_sfn, "edges") |> as_tibble() |> 
+  semi_join(
+    as_tibble(lines_3dhp_sfn, "edges") |> as_tibble() |> count(from) |> arrange(desc(n)) |> filter(n > 1), 
+    by = "from"
+  )
+
+#could try defining 'root' by lowest elevation node (73095)
+#tidygraph::bfs_dist and similar need a root defined...
+lines_3dhp_sfn |> 
+  mutate(depth = tidygraph::bfs_dist(root = 73095, mode = "in")) |> as_tibble("nodes") |> as_tibble() |> count(depth) |> print(n = 40)
+
+lines_3dhp_sfn <- lines_3dhp_sfn |>  
+    mutate(
+      idn = seq_along(SHAPE),
+      #raindrop perspective paths from nodes to root
+      #d_root = tidygraph::node_distance_to(tidygraph::node_is_root()),
+      d_root = tidygraph::node_distance_to(73095),
+      #d_root_ft = tidygraph::node_distance_to(tidygraph::node_is_root(), weights = shape_length),
+      #d_root_km = 0.0003 * d_root_ft,
+      #looking 'up' perspective to perimeter from per-node 'me'
+      in_n = tidygraph::local_size(order = nrow(tidygraph::.N()), mode = "in")
+    )
+
+as_tibble(lines_3dhp_sfn, "nodes") |> arrange(desc(d_root))
+#illustrates complexity of lower system distributary/slough structure
+as_tibble(lines_3dhp_sfn, "nodes") |> arrange(d_root) |> slice(1:10) |> st_zm() |> mapview::mapview()
+as_tibble(lines_3dhp_sfn, "edges") |> select(-COMID) |>
+  filter(to %in% {as_tibble(lines_3dhp_sfn, "nodes") |> arrange(d_root) |> slice(1:50) |> pull(idn)}
+  ) |> 
+  st_zm() |> mapview::mapview()
+```
+
+
+```{r predef_rooted_tree}
+#dev 'tree-based' workflow from a priori determined root
+#acknowledging that split paths and divergences are biogeo correct
+#but need categorically distinct handling?
+
+#def root 
+#manual via QGIS inspection; start with Pilchuck Creek
+root_edge_uid <- 73853
+# #node id in of root_edge in original, pre-convert indexing
+# filter(as_tibble(sfn, "edges"), uid == root_edge_uid)$to
+
+#need separate declarations to assure node ID in to_local_neighborhood
+#and less importantly the order to search over
+#also have sfnetworks::to_spatial_neighborhood,
+  #node = filter(as_tibble(sfn, "edges"), uid == root_edge_uid)$to,
+  #threshold = , #in sf units; untested whether it would work to use edge attribute as: weights = length_ft
+
+sfn <- lines_3dhp |>
+  select(comid, desc = Desc, uid = UniqueID, GNIS_Name, 
+         length_ft = SHAPE_Length, zmax, zslope_est) |> 
+  sfnetworks::as_sfnetwork() 
+
+sfn <- sfn |> 
+  tidygraph::convert(
+    tidygraph::to_local_neighborhood,
+    node = filter(as_tibble(sfn, "edges"), uid == root_edge_uid)$to,
+    mode = "in", 
+    order = tidygraph::with_graph(sfn, tidygraph::graph_order())
+    ,
+    .clean = T
+  )
+# #already 'directed acyclic simple graph with 1 component'
+# #seems unlikely that 3DHP would have loops/multiples?
+# #can add back to pipe if seems needed for certainty
+# tidygraph::convert(sfnetworks::to_spatial_simple, .clean = T) 
+
+# #however, Pilchuck has a valid split path at node 1033
+# as_tibble(sfn, "edges") |> as_tibble() |> count(from) |> arrange(desc(n)) |> filter(n > 1)
+# list(
+#   edge = as_tibble(sfn, "edges") |> st_zm(),
+#   node = as_tibble(sfn, "nodes") |> st_zm() |> rowid_to_column("idn") |> mutate(issplit = if_else(idn==1033,T,F))
+#   ) |> mapview::mapview(zcol = list(NULL, "issplit"))
+
+#this still works but now has a different index value (from 73858 to 7131)
+root_node_idn <- filter(as_tibble(sfn, "edges"), uid == root_edge_uid)$to
+
+sfn <- sfn |> 
+  tidygraph::activate("nodes") |> 
+  mutate(
+    idn = seq_along(SHAPE),
+    #raindrop perspective paths from nodes to root
+    d_root = tidygraph::node_distance_to(root_node_idn),
+    d_root_ft = tidygraph::node_distance_to(root_node_idn, weights = length_ft),
+    d_root_km = 0.0003 * d_root_ft,
+    #looking 'up' perspective to perimeter from per-node 'me'
+    in_n = tidygraph::local_size(order = tidygraph::graph_order(), mode = "in", mindist = 1)
+    ) |> 
+  arrange(d_root) |> 
+#as in 'prep_sfn'
+#associate the immediately upstream streamlength from edges to each 'to' node
+#summed over both upstream tribs; also add 'below_culvert' logical:
+# defining per-node state in {no-incoming, not, culvert, not+not, culvert+not, culvert+culvert}
+  left_join(
+    select(as_tibble(as_tibble(sfn, active = "edges")), uid, idn = to, length_ft, desc, zslope_est, zmax) |>
+      summarise(
+        node_below_culvert = if_else(any(str_detect(desc, "ulvert")), T, F),
+        in_slope_max = max(zslope_est),
+        in_ft = sum(length_ft),
+        .by = "idn"),
+    by = "idn"
+  )
+#wait to add 'above' neighborhood length until pruned by slope
+
+
+#prune periphery by slope
+#interesting options to consider. 
+#more efficient to begin from root and breadth-first-search up, stopping at any reach over a gradient threshold?
+
+plot.ecdf(as_tibble(sfn, "nodes")$in_slope_max)
+slope_threshold <- -0.3
+
+#some slopes >100%, but actually appear to be valid (e.g., ) 
+list(
+  edge = as_tibble(sfn, "edges") |> st_zm(),
+  node = as_tibble(sfn, "nodes") |> st_zm()
+  ) |> mapview::mapview(zcol = list("length_ft", "in_slope_max"))
+
+# #480 ft, 2455-1969=486ft drop, so actually the >100% estimate is not off...
+# #and some individual point-to-points are well over that
+# m <- filter(lines_3dhp, UniqueID==69444) |> pull(SHAPE) |> st_coordinates() 
+# slopes::slope_matrix_weighted(m, lonlat = F)
+# slopes::slope_matrix(m, lonlat = F)
+# (p <- filter(lines_3dhp, UniqueID==69444) |> pull(SHAPE) |> st_cast("POINT") |> st_as_sf() |> rename(g = x) |>  
+#   mutate(
+#     g2 = lead(g),
+#     grnd_dist = st_distance(g, g2, by_element = T),
+#     e1 = st_coordinates(g)[,"Z"],
+#     e2 = st_coordinates(g2)[,"Z"],
+#     elev_drop = e1 - e2,
+#     slp = elev_drop / grnd_dist
+#     ))
+
+# #ignoring routedness 'strands' some lower gradient components
+# #and mostly trims leaf nodes with NA 'in_slope_max'
+# x <- sfn |> 
+#   tidygraph::activate("nodes") |> 
+#   filter(in_slope_max > slope_threshold) 
+# 
+# list(
+#   trim = as_tibble(x, "edges") |> st_zm(),
+#   full = as_tibble(sfn, "edges") |> st_zm()
+# ) |> mapview::mapview(color = c("orange","blue"))
+# 
+# #cleaner to filter out edges then just reduce to the component that includes root?
+# y <- sfn |> 
+#   tidygraph::activate("edges") |> 
+#   filter(zslope_est > slope_threshold) 
+# #yes. better. still gets rid of steep fringes and/but creates 767 components
+# yy <- y |> tidygraph::convert(
+#   tidygraph::to_largest_component, .clean = T
+#   )
+# yy |> filter(uid == root_edge_uid)
+# 
+# list(
+#   yy = as_tibble(yy, "edges") |> st_zm(),
+#   y = as_tibble(y, "edges") |> st_zm(),
+#   full = as_tibble(sfn, "edges") |> st_zm()
+# ) |> mapview::mapview(color = c("purple","green","blue"))
+
+sfn <- sfn |>
+  tidygraph::activate("edges") |>
+  filter(zslope_est > slope_threshold) |> #greater than a negative value
+  tidygraph::convert(tidygraph::to_largest_component, .clean = T) |> 
+  tidygraph::activate("nodes") |> 
+  mutate(
+    in_ft_all = tidygraph::map_local_dbl(
+      order = tidygraph::graph_order(), 
+      mode = "in",
+      .f = function(neighborhood, ...){
+        sum(as_tibble(neighborhood, active = 'nodes')$in_ft, na.rm = T)
+      }
+    ),
+    in_km_all = 0.0003 * in_ft_all,
+    in_ft_pct = in_ft_all / max(in_ft_all)
+  )
+
+#so now...
+sfn_culv <- as_tibble(sfn, "nodes") |> filter(node_below_culvert)
+#if topology attributes added back to edges, could also have edge/reach/culvert length
+#not associated to nodes themselves 
+as_tibble(sfn_culv) |> 
+  ggplot() + 
+  geom_point(aes(d_root_km, in_slope_max, color = in_km_all, size = in_km_all)) +
+  scale_size_binned_area(max_size = 4) +
+  scale_color_binned()
+
+
+#hydgeo scaling (on upstream length as DA proxy) for est width & depth - but can/should be able to get directly from DEM?
 
 ```
 
@@ -974,6 +1254,7 @@ ggplot() +
 } + 
   plot_layout(ncol = 1)
 
+ggsave(filename = "figures/f_bigjim_overlay.png", width = 7, height = 11, dpi = 150, bg = "white")
 
 ```
 
