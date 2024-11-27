@@ -15,6 +15,13 @@ format:
       margin-width: 20px
 ---
 
+to-do
+  - culverts
+    - test length*slope (width?) as non-dollar relative 'cost' indicator
+    - hydgeo scaling (on upstream length as DA proxy) for est width & depth - but can/should be able to get directly from DEM?
+  - stream type
+    - tabulations
+
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE, fig.width = 8, fig.height = 8)
@@ -913,7 +920,7 @@ sfn <- sfn |>
 #   node = as_tibble(sfn, "nodes") |> st_zm() |> rowid_to_column("idn") |> mutate(issplit = if_else(idn==1033,T,F))
 #   ) |> mapview::mapview(zcol = list(NULL, "issplit"))
 
-#this still works but now has a different index value (from 73858 to 7131)
+#this still works but now has a different index value (from 73858 to 7131) due to `convert`
 root_node_idn <- filter(as_tibble(sfn, "edges"), uid == root_edge_uid)$to
 
 sfn <- sfn |> 
@@ -943,6 +950,9 @@ sfn <- sfn |>
   )
 #wait to add 'above' neighborhood length until pruned by slope
 
+#2421 NA node_below_culvert at upstream end of perimeter edges
+as_tibble(as_tibble(sfn, "nodes")) |> count(node_below_culvert) 
+
 
 #prune periphery by slope
 #interesting options to consider. 
@@ -955,7 +965,9 @@ slope_threshold <- -0.3
 list(
   edge = as_tibble(sfn, "edges") |> st_zm(),
   node = as_tibble(sfn, "nodes") |> st_zm()
-  ) |> mapview::mapview(zcol = list("length_ft", "in_slope_max"))
+  ) |> 
+  #mapview::mapview(zcol = list("length_ft", "in_slope_max"))
+  mapview::mapview(zcol = list("length_ft", "node_below_culvert"))
 
 # #480 ft, 2455-1969=486ft drop, so actually the >100% estimate is not off...
 # #and some individual point-to-points are well over that
@@ -1005,6 +1017,7 @@ sfn <- sfn |>
   tidygraph::convert(tidygraph::to_largest_component, .clean = T) |> 
   tidygraph::activate("nodes") |> 
   mutate(
+    idn = seq_along(SHAPE),
     in_ft_all = tidygraph::map_local_dbl(
       order = tidygraph::graph_order(), 
       mode = "in",
@@ -1016,20 +1029,185 @@ sfn <- sfn |>
     in_ft_pct = in_ft_all / max(in_ft_all)
   )
 
-#so now...
-sfn_culv <- as_tibble(sfn, "nodes") |> filter(node_below_culvert)
+
+## ordinate culverts by root dist & upstream extent & slope & length
+## slope_threshold filter creates some stranded perimeter 'below_culv' nodes
+anti_join(
+  as_tibble(as_tibble(sfn, "nodes")) |> filter(node_below_culvert)  #983
+  ,
+  as_tibble(as_tibble(sfn, active = "edges")) |> filter(str_detect(desc, "ulvert")) #955
+  ,
+  by = c("idn" = "to")
+) #31
+
+as_tibble(as_tibble(sfn, "nodes")) |> count(node_below_culvert)
+#confirming that the 31 TRUE below_culvert nodes are at perimeter having had their upstream edges, at least one of which was culvert, cut off
+list(
+  edge = as_tibble(sfn, "edges") |> st_zm(),
+  node = as_tibble(sfn, "nodes") |> st_zm(),
+  # foo = anti_join(
+  #   as_tibble(sfn, "nodes") |> filter(node_below_culvert),
+  #   as_tibble(as_tibble(sfn, active = "edges")) |> filter(str_detect(desc, "ulvert")),
+  #   by = c("idn" = "to")
+  # ) |> st_zm()
+  foo = as_tibble(sfn, "nodes") |> slice(415) |> st_zm()
+) |>
+  mapview::mapview(zcol = list("length_ft", "node_below_culvert", "d_root"))
+
+
 #if topology attributes added back to edges, could also have edge/reach/culvert length
 #not associated to nodes themselves 
+#maybe better to overhaul/re-do treating edges as nodes? sfn |> tidygraph::convert(tidygraph::to_linegraph) 
+
+sfn_culv <- as_tibble(sfn, active = "edges") |> 
+  filter(str_detect(desc, "ulvert")) |> 
+  left_join(
+    as_tibble(as_tibble(sfn, "nodes")) |> 
+      select(to = idn, 
+             #node_below_culvert, 
+             starts_with("d_"), 
+             in_ft_all, in_km_all, in_ft_pct #starts_with("in_")
+             )
+    ,
+    by = "to"
+  )
+
+sfn_culv |> st_zm() |> st_centroid() |> 
+  mapview::mapview(zcol = "in_km_all")
+
+#interesting/useful, and/but note the outlier high in_km is uid 64871 Lake Creek with Lk Cavanaugh and all its tribs above
+#such that it could indeed be a critical culvert...or not, depending on expectations for through lake mvmt
+plotly::ggplotly(
 as_tibble(sfn_culv) |> 
   ggplot() + 
-  geom_point(aes(d_root_km, in_slope_max, color = in_km_all, size = in_km_all)) +
-  scale_size_binned_area(max_size = 4) +
-  scale_color_binned()
+  #geom_point(aes(d_root_km, zslope_est, color = in_km_all, size = in_km_all)) +
+  #geom_point(aes(d_root_km, in_km_all, color = abs(zslope_est), size = abs(zslope_est))) +
+  geom_point(aes(d_root_km, in_km_all, color = abs(zslope_est), size = length_ft), alpha = 0.5) 
+#+ scale_size_binned_area(max_size = 4) + scale_color_binned()
+)
 
+#need some 'marginal habitat gain' for optimization
+#calc distance to next upstream culvert (or end of line if none)?
+#could do all-to-all then determine nearest then use that to index out of all-all object
+#this works, https://luukvdmeer.github.io/sfnetworks/reference/st_network_cost.html
 
-#hydgeo scaling (on upstream length as DA proxy) for est width & depth - but can/should be able to get directly from DEM?
+#direction "in" defines distances from upstream nodes
+#for first row (root node) equivalent to d_root_ft
+d_in <- sfnetworks::st_network_cost(sfn, direction = 'in', weights = as_tibble(sfn, "edges")$length_ft)
+d_in[1:10,1:10]
+#per-row, the min distance is always 0 to self, the second (next largest in sort) is the nearest upstream
+#so when subset to the "to-node" of culvert edges becomes the closest upstream culvert, possibly Inf if none above
+#however need logic to use 'in_ft_all' if d_in==Inf since 'final' culverts may have lots of upstream length
+apply(d_in[sfn_culv$to, sfn_culv$to], 1, \(x) sort(x)[2])
+which(sfn_culv$to==10) #index 415 is node 10: sfn_culv$to[415]
+apply(d_in[sfn_culv$to, sfn_culv$to], 1, \(x) sort(x)[2])[415] #9104 ~ 69+2793+267+975+2218+1839+76+197+668
+apply(d_in[sfn_culv$to, sfn_culv$to], 1, \(x) sort(x)[2])[which(sfn_culv$to==76)] #466 ~ 33.25+267+165.6
+apply(d_in[sfn_culv$to, sfn_culv$to], 1, \(x) sort(x)[2])[which(sfn_culv$to==121)] #207 ~ 66.3+140.8
+apply(d_in[sfn_culv$to, sfn_culv$to], 1, \(x) sort(x)[2])[which(sfn_culv$to==205)] #Inf as it should be with no higher culverts
+
+#direction "out" defines distances downstream to nodes below
+#first row (root/outlet) is all Inf other than 0 on diag
+#the per-row min is again always 0 to self but now the next largest is distance to nearest downstream
+#and when subset to culvert edge "to-node" means that Inf values are paths with no downstream culverts before the root
+#which is quite interesting for highlighting 'already open' paths or equivalently the lowest culvert in any subbasin!
+d_out <- sfnetworks::st_network_cost(sfn, direction = 'out', weights = as_tibble(sfn, "edges")$length_ft)
+d_out[1:10,1:10]
+apply(d_out[sfn_culv$to, sfn_culv$to], 1, \(x) sort(x)[2])
+
+#trying to get the subgraph of shortest paths from (lowest) culverts with none below to root
+lowest_culv <- sfn_culv$to[which(apply(d_out[sfn_culv$to, sfn_culv$to], 1, \(x) sort(x)[2])==Inf)]
+lowest_culv_paths <- sfnetworks::st_network_paths(sfn, from = 1, to = lowest_culv, mode = 'in')
+
+sfn_lowest_culv <- sfn |> 
+  tidygraph::activate("edges") |> 
+  slice(unique(unlist(lowest_culv_paths$edge_paths))) |> 
+  tidygraph::convert(
+    tidygraph::to_largest_component
+  ) 
+
+ggplot() +
+  geom_sf(data = as_tibble(sfn, "edges"), color = "lightblue") +
+  geom_sf(data = as_tibble(sfn_lowest_culv, "edges"), color = "darkgreen")
+
+list(
+  edge = as_tibble(sfn, "edges") |> st_zm(),
+  node = as_tibble(sfn, "nodes") |> st_zm(),
+  lowculv = as_tibble(sfn_lowest_culv, "edges") |> st_zm()
+) |>
+  mapview::mapview(zcol = list("length_ft", "node_below_culvert", "length_ft"))
+
+# #something more elegant? https://luukvdmeer.github.io/sfnetworks/articles/sfn05_routing.html
+# #maybe riffing off https://stackoverflow.com/questions/76115139/create-subgraph-from-shortest-path-calculation-sfnetworks-r
+# #could not get tidygraph::node_distance_from mapping correctly
+# #this is correct but slow as-is, likely easy speed up at least from declaring weight vector standalone
+# sfn |> 
+#   mutate(
+#     d_culv_up = map_dbl(
+#       idn,
+#       ~sort(sfnetworks::st_network_cost(sfn, from = sfn_culv$to, to = .x, direction = 'out', weights = as_tibble(sfn, "edges")$length_ft))[2]
+#     )
+#   ) 
+
+#for now use the distance to the nearest upstream culvert or all upstream length if no culverts above
+#non-culvert nodes need first position of sort: apply(d_in[, sfn_culv$to], 1, \(x) sort(x)[1])
+sfn_culv <- sfn_culv |> 
+  mutate(
+    d_culv_up = apply(d_in[to, to], 1, \(x) sort(x)[2])
+    ,
+    hmarg = if_else(is.infinite(d_culv_up), in_ft_all, d_culv_up)
+    ,
+    psuedocost = abs(length_ft * as.vector(zslope_est))
+  )
 
 ```
+
+try for something derived from  `solve_opt` from https://github.com/sljardine/upstream/blob/main/upstream/R/fct_Suggest.R
+
+```{r try_solve_opt}
+
+# # objective function
+# obj <- ROI::L_objective(v)
+# # constraints
+# bc <- ROI::L_constraint(L = brc, dir = "<=", rhs = budget) #budget
+# hc <- ROI::L_constraint(L = diag(nb) - t(D), dir = rep("<=", nb), rhs = 1 - di) #hydrology
+# # problem & solution
+# # bc and hc
+# prob <- ROI::OP(objective = obj,
+#                 constraints = c(bc, hc),
+#                 bounds = ROI::V_bound(li = 1 : nb, lb = rep.int(0, nb), ui = 1 : nb, ub = rep.int(1, nb)),
+#                 types = rep.int("B", nb),
+#                 maximum = TRUE)
+# 
+# sol <- ROI::ROI_solve(prob, "glpk",  control = list("verbose" = TRUE, "presolve" = TRUE))
+# soln <- as.logical(ROI::solution(sol))
+
+#start with unweighted hab: obj==1 s.t. points$hmarg -> h -> v, 
+#with points sf df with: "hmarg_length, hmarg_area, hmarg_volume, cost, and wria_number"
+#inspecting D.rda from repo, 'connectivity matrix' means binary but need to follow up with Sunny on exactly how generated
+#here, 1 if culvert-i (row) has a non-infinite downstream distance to culvert-j (col)
+#note need: install.packages("ROI.plugin.glpk")
+library(ROI.plugin.glpk)
+ROI::ROI_registered_solvers()
+#so this runs but 'sol' is allNA and throws "PROBLEM HAS NO PRIMAL FEASIBLE SOLUTION"
+v <- sfn_culv$hmarg
+D <- 1*!is.infinite(d_out[sfn_culv$to, sfn_culv$to])
+brc <- sfn_culv$psuedocost
+nb <- length(v)
+di <- colSums(D)
+budget <- 20 #plot(density(brc)); quantile(brc, p = seq(0,1, by = 0.1))
+obj <- ROI::L_objective(v)
+bc <- ROI::L_constraint(L = brc, dir = "<=", rhs = budget) #budget
+hc <- ROI::L_constraint(L = diag(nb) - t(D), dir = rep("<=", nb), rhs = 1 - di) #hydrology
+prob <- ROI::OP(objective = obj,
+                constraints = c(bc, hc),
+                bounds = ROI::V_bound(li = 1 : nb, lb = rep.int(0, nb), ui = 1 : nb, ub = rep.int(1, nb)),
+                types = rep.int("B", nb),
+                maximum = TRUE)
+sol <- ROI::ROI_solve(prob, solver = "glpk",  control = list("verbose" = TRUE, "presolve" = TRUE))
+soln <- as.logical(ROI::solution(sol))
+
+```
+
 
 
 fit for 'prob of being a real culvert'?
