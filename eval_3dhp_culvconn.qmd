@@ -1,0 +1,700 @@
+---
+title: "Evaluation of 'culvert connectors' in 3DHP Stillaguamish pilot"
+author: "dan.auerbach@dfw.wa.gov"
+date: "`r Sys.Date()`"
+format:
+  html:
+    embed-resources: true
+    theme: yeti 
+    code-fold: true
+    toc: true
+    toc-location: left
+    grid:
+      sidebar-width: 180px
+      body-width: 1100px
+      margin-width: 20px
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.width = 9, fig.height = 10)
+
+library("tidyverse", quietly = T)
+library("sf")
+library("patchwork")
+library("gt")
+library("sfnetworks")
+theme_set(theme_minimal()) 
+
+dir_data_common <- "~/T/DFW-Team WDFW Watershed Synthesis - data_common"
+epsg <- 2927 #WA state standard; NAD83(HARN)/ft
+
+pal_culv_strm <- c("grey20","#005C84") #"#004661"  "lightblue"
+
+load("eval_3dhp_culvconn.RData")
+```
+
+# Context
+
+Our shared map of Washington's river networks is undergoing a major refinement, with the transformation to "3DHP": hydrography based on LiDAR representations of ground elevation and the geomorphic signature of flowing waters (*sensu* [RCW 77.55.011](https://app.leg.wa.gov/RCW/default.aspx?cite=77.55.011) defining 'waters of the state' by reference to the *"'Ordinary high water line' means the mark on the shores of all water that will be found by examining the bed and banks and ascertaining where the presence and action of waters are so common and usual, and so long continued in ordinary years as to mark upon the soil or vegetation a character distinct from the abutting upland."*).
+
+The modernization to 3DHP includes the systematic representation of "Connector: Culvert" line segments within the larger river network flowline dataset. Accordingly, this document provides an initial overview of some aspects of these 3DHP culvert features and their relationship to data in the WDFW inventory of potential fish passage barriers.
+
+The pilot project report "*Stillaguamish Watershed Lidar-derived 3DHP*" prepared by NV5 Geospatial (June 9, 2023), describes the general method by which 3DHP culvert line features are constructed:
+
+> "The elevation derived hydrography specification calls for the segmentation and distinction of culvert features from the rest of the flowline network. Culvert features were automatically identified by comparing the monotonically enforced elevation values to the elevation ground model. Vertices that are misaligned with the DEM surface after monotonic Z smoothing and in close proximity to ancillary road and culvert data were extracted and used to classify culverts within the network. This segmentation process was manually reviewed. Additional culverts were manually extracted as necessary."
+
+
+
+See also:
+  - [Pilot project final report](https://apps.ecology.wa.gov/publications/summarypages/2401002.html)
+    - extensive description of results, including field verification efforts, and discussion of future issues
+  - [Pilot project story map](https://gis.ecology.wa.gov/portal/apps/sites/#/washington-state-hydrography-dataset-program/apps/67cd5024134848c2ab19a330d5d2ad0c/explore)
+  - [Implementation plan](https://fortress.wa.gov/ecy/gispublic/AppResources/WASHD/WASHD%20Statewide%20Implementation%20Plan.pdf)
+    - including details of QAQC and review
+  - [Current statewide status/progress](https://gis.ecology.wa.gov/portal/apps/experiencebuilder/experience/?draft=true&id=b37b8b602a2e49b9b6a10578285f10f7&page=Page&views=State-Status-Map%2CStatewide-Progress)
+
+
+# Datasets
+
+Load pilot gdb linestrings and make a mask of the boundary to spatially subset other data.
+
+```{r sf_3dhp, eval=FALSE}
+# sf::st_layers(file.path(dir_data_common, "3dhp/17110008_EDH_230605.gdb"))
+# note "Polygons" are the 'waterbodies' traversed by artificial path linestrings
+
+# #after initial read before select()
+# as_tibble(lines) |> #glimpse()
+#   #count(FClass, EClass) #Fclass all 1, Eclass 0,2,3
+#   #count(Source) #all "Lidar YYYY", mostly 2017 and 2013
+#   #count(Method) #all "Flow direction and accumulation combined with proprietary methods"
+#   #count(UserCode) #all NA except 2 " "
+#   #count(Comments) #mostly NA, sort of interesting but probably not standard, in USGS?
+#   count(GNIS_Name) #100 names and a few versions of blanks and nulls
+
+
+#ifn 2927, 74K, note XYZ-ness
+#confirmed multilinestring to linestring is class change only
+#mutate adds highest elev XY lineseg and gradient (mean, weighted by point-to-point length in lineseg)
+#could add custom function to `slope_xyz` to calc max gradient along reach rather than length-weighted default
+sf_3dhp <- sf::st_read(
+  file.path(dir_data_common, "3dhp/17110008_EDH_230605.gdb"), 
+  layer = "Lines"
+) |> 
+  select(
+    #-c(EClass, FClass, Method, UserCode, Comments),
+    uid = UniqueID,
+    fcode = FCode, dscrp = Desc, #Source?
+    gnis_name = GNIS_Name,
+    length_ft = SHAPE_Length
+    ) |> 
+  sf::st_cast("LINESTRING") |> 
+  mutate(
+    across(SHAPE, list(
+      zslope_est = ~slopes::slope_xyz(., directed = T),
+      zmax = ~map_dbl(., ~slopes::z_max(.x))
+      ), .names = "{.fn}")
+  ) 
+
+#get a spatial mask for other data that is tighter than bbox
+#concave hull of boundary (points) of union, trial & error to 0.05
+sf_3dhp_mask <- sf_3dhp |> 
+  st_union() |> 
+  st_boundary() |> 
+  st_concave_hull(ratio = 0.05)
+```
+
+```{r sf_3dhp_culv_strm, eval=T}
+#create subsets, eval=T to reduce size of saved environment
+#subset the "Connector: Culvert"
+sf_3dhp_culv <- sf_3dhp |> filter(str_detect(dscrp, "ulvert")) 
+#and the "Stream/River"
+sf_3dhp_strm <- sf_3dhp |> filter(str_detect(dscrp, "tream")) 
+
+```
+
+Load a public "WdfwFishPassage.gdb" and subset to culverts within the focal extent.
+
+```{r sf_fpb_3dhp, eval=FALSE}
+#also: tbl(con_fpdsi, "SiteFishPassageViewSpatial") for current but need to revisit permissions for full schema
+#assume, based on crossref to webapp ()
+#FishUseCode 0: missing, 10: yes, 20: no, 99: unknown 
+#FishUseCriteriaCode 10: other, 11: biological, 12: physical, 13: mapped, NA:NA
+#FPBarrierStatusCode 0: no/NA, 10: yes, 20: no?, 99: unknown
+#FPBarrierReasonCode 0: no/NA, 10: WSdrop, 11: slope, 12: rack(?), 20: velocity, 21: depth, 30: tidegate, 31: other, 40: Level B reqd, 41: Insuff Data, others...
+#PercentFishPassableCode 0: NA, 10: 0%pass, 20: 33%pass, 30:67%pass, 40: 100%pass, 99: unk
+
+
+sf_fpb <- sf::read_sf(
+  file.path(dir_data_common,"WdfwFishPassage.gdb"), 
+  layer = "WDFW_FishPassageSite"
+  ) |> 
+  sf::st_transform(epsg) |> 
+  rename_with(.cols = starts_with("FishPassage"), .fn = ~str_replace(., "FishPassage","FP")) |> 
+  filter(
+    FPFeatureTypeCode==1 #culverts
+    # #!is.na(BarrierCorrectionTypeCode)
+    # !is.na(BarrierCorrectionYearsText)
+  ) |> 
+  mutate(
+    fish_use = case_when(
+      FishUseCode == 10 ~ "yes",
+      FishUseCode == 20 ~ "no",
+      FishUseCode == 99 ~ "unk"
+    )
+  ) |> 
+  left_join(
+    tibble(
+      OwnerTypeCode = c(1:7,9,10,12), 
+      owner = c("city", "county", "federal", "private", "state", "tribal", "other", "drainage_dist", "diking_dist", "unk")
+    ),
+    by = "OwnerTypeCode"
+  ) |> 
+  mutate(across(ends_with("Code"), ~factor(.)))
+
+sf_fpb_3dhp <- sf_fpb[sf_3dhp_mask,] 
+rm(sf_fpb)
+
+```
+
+Subset flowlines to those closest to points in FPDSI.
+
+```{r sf_3dhp_near_fpb, eval=FALSE}
+##unused alternative
+# sf_fpb_3dhp$uid <- sf_3dhp$uid[st_nearest_feature(sf_fpb_3dhp, sf_3dhp)]
+# left_join(sf_fpb_3dhp, as_tibble(sf_3dhp), by = "uid")
+
+
+#subset lines and reindex/sort lines by fpb points
+#the order of x$SiteRecordID defines the order of y$uid/y-rownum
+sf_3dhp_near_fpb <- sf_3dhp[st_nearest_feature(sf_fpb_3dhp, sf_3dhp),]
+# #such that pairwise distances are indexed identically
+# identical(
+# st_distance(sf_fpb_3dhp, sf_3dhp_near_fpb, by_element = T),
+# st_distance(sf_3dhp_near_fpb, sf_fpb_3dhp, by_element = T)
+# )
+#and can be added to lines
+sf_3dhp_near_fpb$SiteRecordID <- sf_fpb_3dhp$SiteRecordID 
+sf_3dhp_near_fpb$d_fpb_ft <- st_distance(sf_fpb_3dhp, sf_3dhp_near_fpb, by_element = T) |> as.numeric() |> round(2)
+# #checking: 
+# mapview::mapview(list(l = st_zm(sf_3dhp_near_fpb), p = sf_fpb_3dhp))
+sf_3dhp_near_fpb <- sf_3dhp_near_fpb |> 
+  left_join(as_tibble(sf_fpb_3dhp), by = "SiteRecordID")
+
+```
+
+
+# Basic 3DHP properties
+
+Of the `r nrow(sf_3dhp)` line segments in the pilot dataset, `r nrow(sf_3dhp_culv)` or nearly 12% have the descriptor field value "Connector: Culvert" (note that "Artificial path" refers to segments through 'waterbody' polygons created in GIS for topological routing, not to actual anthropogenic flow paths).
+
+These segments are distributed throughout the network, and include substantial variation in length, elevation, and slope (i.e., reach gradient).
+
+```{r gt_basic}
+as_tibble(sf_3dhp) |> 
+  count(dscrp) |> 
+  mutate(pct = n / sum(n)) |> 
+  arrange(desc(n)) |> 
+  gt() |> 
+  fmt_number(columns = n, decimals = 0) |> 
+  fmt_percent(columns = pct)
+```
+
+```{r gg_culv_map}
+ggplot() +
+  geom_sf(data = sf_3dhp_culv, color = pal_culv_strm[1]) +
+  ggspatial::annotation_scale(location = "bl") +
+  labs(title = "Locations of 'Connector: culvert' segments")
+```
+
+```{r gg_culv_hist}
+as_tibble(sf_3dhp_culv) |> 
+  select(uid, length_ft, zmax, zslope_est) |> 
+  pivot_longer(-uid) |> 
+  ggplot() +
+  geom_histogram(aes(value), bins = 40, color = pal_culv_strm[1]) +
+  facet_wrap(~name, scales = "free") +
+    labs(x = "")
+```
+
+However, culvert segments tend to be shorter and lower slope relative to the "Stream/River" segments that make up the majority of the flowlines.  
+
+```{r gg_length_slope_scatter}
+# ggplot() +
+#   stat_ecdf(data = as_tibble(sf_3dhp_culv), aes(length_ft), color = pal_culv_strm[1]) +
+#   stat_ecdf(data = as_tibble(sf_3dhp_strm), aes(length_ft), color = pal_culv_strm[2]) +
+#   scale_x_continuous(limits = c(0, 500))
+
+{
+  ggplot() +
+    geom_point(data = as_tibble(sf_3dhp_strm), aes(length_ft, abs(zslope_est)), size = 0.5, alpha = 0.5, color = pal_culv_strm[2]) +
+    geom_point(data = as_tibble(sf_3dhp_culv), aes(length_ft, abs(zslope_est)), size = 0.5, alpha = 0.5, color = pal_culv_strm[1]) +
+    scale_x_log10()
+}+{
+  ggplot() +
+    geom_bin2d(data = as_tibble(sf_3dhp_strm), aes(length_ft, abs(zslope_est))) +
+    scale_x_log10() + scale_fill_gradient(low = alpha(pal_culv_strm[2], 0.2), high = pal_culv_strm[2]) +
+    labs(subtitle = "Stream/river segments")
+}+{
+  ggplot() +
+    geom_bin2d(data = as_tibble(sf_3dhp_culv), aes(length_ft, abs(zslope_est))) +
+    scale_x_log10() + scale_fill_gradient(low = alpha(pal_culv_strm[1], 0.2), high = pal_culv_strm[1]) +
+    labs(subtitle = "Culvert segments")
+}+
+  plot_layout(ncol = 1)
+
+```
+
+```{r gt_minmedmax}
+#as_tibble(sf_3dhp_culv) |>
+as_tibble(sf_3dhp) |>
+  summarise(
+    n = n(),
+    across(
+      c(length_ft, zmax, zslope_est),
+      list(
+        min = ~min(.),
+        med = ~median(.),
+        max = ~max(.)
+      ),
+      .names = "{.col}.{.fn}"
+    ),
+    .by = dscrp
+  ) |>
+  gt() |>
+  fmt_number(c(contains("length"), contains("zmax")), decimals = 0) |>
+  fmt_number(contains("slope"), decimals = 3) |> 
+  tab_spanner(label = "length_ft", columns = contains("length")) |> 
+  tab_spanner(label = "zmax", columns = contains("zmax")) |> 
+  tab_spanner(label = "zslope_est", columns = contains("zslope_est")) |> 
+  cols_label_with(fn = ~str_remove(.,"length_ft.|zmax.|zslope_est.")) |> 
+  tab_style(
+    style = cell_borders(sides = "left", weight = px(1)), cells_body(columns = c(contains("med"), contains("max")))
+  ) |> 
+  tab_style(
+    style = cell_borders(sides = "left", weight = px(2)), cells_body(columns = contains("min"))
+  ) |> 
+  tab_style(
+    style = cell_text(weight = "bold"), cells_body(columns = contains("med"))
+  ) |> 
+  tab_style(
+    style = cell_fill(pal_culv_strm[1], alpha = 0.3),
+    locations = cells_body(rows = str_detect(dscrp, "ulvert"))) |> 
+  tab_style(
+    style = cell_fill(pal_culv_strm[2], alpha = 0.3),
+    locations = cells_body(rows = str_detect(dscrp, "tream"))) 
+
+```
+
+Culvert segment length exhibits a relatively even spatial distribution, with shorter (<40ft) and longer (>100ft) reaches throughout the pilot domain. As expected, reach slopes tend to be greater towards the eastern, more mountainous portion of the river network, although some relatively steep segments are located in the lower elevation, central and western areas.
+
+```{r gg_map_by_length_bin}
+sf_3dhp_culv |>
+  st_centroid() |> 
+  ggplot() +
+  geom_sf(aes(size = length_ft, color = zslope_est)) +
+  scale_size_area(max_size = 4) +
+  #darker for more negative/steeper slopes
+  scale_color_gradient(high = alpha(pal_culv_strm[1], 0.1), low = pal_culv_strm[1]) +
+  facet_wrap(
+    #~cut(length_ft, breaks = c(0,40,60,80,100,1000)), ncol = 1
+    ~cut(length_ft, breaks = c(0, seq(20,100,by=10),1000)), ncol = 2
+  )
+  
+```
+
+```{r gg_map_steepculv, fig.height=6}
+sf_3dhp_culv |>
+  st_centroid() |> 
+  ggplot() +
+  geom_sf(aes(size = length_ft, color = abs(zslope_est) >= 0.2), size = 0.5, show.legend = F) +
+  scale_color_discrete(type = c("tan","orange")) +
+  facet_wrap( ~zslope_est < -0.2) +
+  labs(subtitle = "Culvert segments >=20% slope estimate")
+
+```
+
+Nearly all (`r paste0(100*round(sum(is.na(sf_3dhp_culv$gnis_name))/nrow(sf_3dhp_culv),3), "%")`) of these features lack an associated GNIS name, suggesting that they occur either along smaller unnamed streams or in locations where the existing NHD names were not readily transferred. This is consistent, however, with the non-culvert features, of which `r paste0(100*round(sum(is.na(anti_join(as_tibble(sf_3dhp), as_tibble(sf_3dhp_culv), by = "uid")$gnis_name))/(nrow(sf_3dhp)-nrow(sf_3dhp_culv)), 3), "%")` also lack an associated GNIS name. In general, this reflects the substantially increased representation of smaller flowlines relative to existing NHD hydrography. As straightforward additional GIS work can assign an encompassing subbasin, the limited existing GNIS values serve best to illustrate the ease of stratifying by and comparing culvert segments to their 'local context'. For example, several named creeks appear to include higher-than-average slope culvert segments, deviating from a general pattern whereby culverts have lower gradients.
+
+```{r gg_gnis_slope_boxes}
+## showing a steep outlier at the uppermost position of a trib, thus presumably less consequentional for passage
+# list(
+#   stream = sf_3dhp |> filter(str_detect(gnis_name, "Middle")) |> st_zm(),
+#   culvert = sf_3dhp_culv |> filter(str_detect(gnis_name, "Middle")) |> st_zm()
+# ) |> 
+#   mapview::mapview(zcol = "zslope_est")
+# ggplot() +
+#   geom_sf(data = sf_3dhp_strm |> filter(str_detect(gnis_name, "Middle")), aes(color = zslope_est)) +
+#   geom_sf(data = sf_3dhp_culv |> filter(str_detect(gnis_name, "Middle")) |> st_centroid(), aes(color = zslope_est), size = 2) +
+#   wacolors::scale_color_wa_c() +
+#   ggspatial::annotation_scale(location = "br") 
+
+ggplot() +
+  geom_boxplot(
+    data = as_tibble(sf_3dhp_strm) |> 
+      drop_na(gnis_name) |> 
+      filter(gnis_name != "<Null>", gnis_name != " ") |> filter(gnis_name %in% unique(sf_3dhp_culv$gnis_name))
+    , 
+    aes(zslope_est, fct_rev(gnis_name)),
+    outliers = F, varwidth = T, color = pal_culv_strm[2], fill = alpha(pal_culv_strm[2], 0.2)) +
+  geom_point(
+    data = as_tibble(sf_3dhp_culv) |> 
+      drop_na(gnis_name) |> 
+      filter(gnis_name != "<Null>", gnis_name != " "),
+    aes(zslope_est, fct_rev(gnis_name)),
+    size = 0.8, alpha = 0.8, color = pal_culv_strm[1]
+      ) +
+  scale_x_continuous(limits = c(-.7,0)) +
+  labs(y = "", subtitle = "Culvert reach slopes (points) relative to \nstream segments (boxes) for GNIS-named sections")
+```
+
+
+# Relationships with FPDSI culverts
+
+The subset of FPDSI with `FPFeatureTypeCode==1` within the spatial extent of the 3DHP pilot data includes `r nrow(sf_fpb_3dhp)` point locations. The largest sub-group of these are designated with `FishUseCode==10` and `FPBarrierStatusCode==10`. The overall spatial distribution of these points is weighted towards the lower-elevation, western portion of the pilot domain.
+
+```{r gg_fpb_mapcol, fig.height=9}
+{
+  ggplot() +
+    geom_sf(data = sf_3dhp_mask, fill = NA) +
+    geom_sf(data = sf_fpb_3dhp, aes(shape = fish_use, color = FPBarrierStatusCode)) +
+    wacolors::scale_color_wa_d()
+}+{
+  as_tibble(sf_fpb_3dhp) |> 
+    count(fish_use, FPBarrierStatusCode) |> 
+    ggplot() + geom_col(aes(n, fct_rev(FPBarrierStatusCode), fill = FPBarrierStatusCode), show.legend = F) + 
+    wacolors::scale_fill_wa_d() +
+    facet_wrap(~fish_use, nrow = 1) +
+    labs(y = "FPBarrierStatusCode")
+} + 
+  plot_layout(ncol = 1)
+```
+
+Of the `r nrow(sf_fpb_3dhp)` included culvert points, `r sum(sf_3dhp_near_fpb$d_fpb_ft <= 10)` were within 10 feet of a 3DHP line feature, and more than half were closest to a "Connector: culvert".  
+
+```{r gg_nearfpb_count, fig.height=6}
+as_tibble(sf_3dhp_near_fpb) |> 
+  count(dscrp) |> 
+  ggplot() + geom_col(aes(n, fct_reorder(dscrp, n, identity), fill = dscrp), show.legend = F) +
+  scale_fill_manual(values = c("tan","tan","tan",pal_culv_strm[1],"tan",pal_culv_strm[2])) +
+  labs(x = "", y = "", subtitle = "Counts of nearest 3DHP feature types per-FPDSI culvert point")
+```
+
+On average and across "fish use" classes, distances to nearest line feature were shorter for culvert points associated with culvert segments, with a median length of only `r as_tibble(sf_3dhp_near_fpb) |> filter(str_detect(dscrp, "ulvert")) |> pull(d_fpb_ft) |> median() |> round(2)` feet (and IQR ~3-18ft).
+
+```{r gg_nearfpb_dist_box_ecdf}
+{
+  as_tibble(sf_3dhp_near_fpb) |> 
+    filter(str_detect(dscrp, "ulvert|tream")) |> 
+    ggplot(aes(dscrp, d_fpb_ft)) +
+    geom_boxplot(outliers = F, varwidth = T) +
+    geom_jitter(aes(color = dscrp), width = 0.2, alpha = 0.5, size = 0.5, show.legend = F) +
+    scale_color_manual(values = pal_culv_strm) +
+    scale_y_log10(labels = scales::label_log()) +
+    facet_wrap(~fish_use) + #, scales = "free"
+    labs(x = "", y = "Distance (ft)", subtitle = "Pairwise distances between FPDSI points and 3DHP lines \nstratified by 'fish use', showing only stream & culvert segments")
+}+{
+  as_tibble(sf_3dhp_near_fpb) |> 
+    filter(str_detect(dscrp, "ulvert|tream")) |> 
+    ggplot() +
+    stat_ecdf(aes(d_fpb_ft, color = dscrp), linewidth = 1.1) +
+    geom_hline(yintercept = c(0.25,0.5,0.75)) +
+    scale_color_manual(name = "", values = pal_culv_strm) +
+    scale_x_log10(labels = scales::label_log()) +
+    theme(legend.position = "bottom")
+} + 
+  plot_layout(ncol = 1)
+```
+
+Further examination is needed to better understand how these datasets relate, but constraining to only the 3DHP culvert-type features within 30ft of the "fish use: yes" culvert point locations (i.e., "best matches") offers a simple illustration of how segment length and gradient might be used for coarse screening or other purposes. While certainly not conclusive, the figure below shows that culvert points with `FPBarrierStatusCode==10` were associated with steeper and longers segments.
+
+```{r gg_near_scatter_lengthslope}
+d_thresh <- 30
+
+as_tibble(sf_3dhp_near_fpb) |> 
+  filter(str_detect(dscrp, "ulvert")) |> #522, 888 when stream included
+  filter(d_fpb_ft <= d_thresh) |> #460, 665 when stream included 
+  filter(fish_use == "yes") |> #427
+  ggplot() +
+  geom_point(aes(length_ft, abs(zslope_est), color = d_fpb_ft), alpha = 0.7, show.legend = T) +
+  wacolors::scale_color_wa_c("forest_fire") +
+  scale_x_log10(labels = scales::label_log(digits = 2)) +
+  facet_wrap(~FPBarrierStatusCode) +
+  labs(title = "Lengths and slopes of 3DHP segments nearest to FPDSI culvert points", 
+       subtitle = "Showing features within 30ft pairwise distance, stratified by 'FPBarrierStatusCode'")
+```
+
+Sorting these "best matches" by steepest slopes facilitates a preliminary cross-reference to the linked report pdfs.
+
+```{r gt_near_steep}
+#could presumably also loop a browseURL call...
+
+as_tibble(sf_3dhp_near_fpb) |> 
+  filter(
+    str_detect(dscrp, "ulvert"),
+    d_fpb_ft <= d_thresh,
+    fish_use == "yes"
+    ) |>
+  arrange(zslope_est) |> 
+  slice_head(n = 10) |> 
+  select(uid, length_ft, zslope_est, SiteId, d_fpb_ft, StreamName:RoadName,FPBarrierStatusCode:PercentFishPassableCode, FormLinkURL) |> 
+  gt() |> 
+  cols_label_with(fn = ~str_remove(., "Code")) |> 
+  tab_style(
+    cell_text(size = "small"),
+    cells_column_labels(StreamName:FormLinkURL)
+  ) |> 
+  fmt_number(columns = length_ft, decimals = 1) |> 
+  fmt_number(columns = zslope_est) |> 
+  fmt_url(columns = FormLinkURL)  
+
+```
+
+
+# Network properties: Pilchuck Creek example
+
+The representation of culverts as linear features within a larger directed graph of flowlines facilitates calculation of additional attribute values related to network position and topology. Such values may be useful when comparing among many culverts. 
+
+This is illustrated for Pilchuck Creek, a sample subbasin within the Stillaguamish pilot domain.
+
+```{r sfn_pilchuck, eval=FALSE}
+#def root manual via QGIS inspection; start with Pilchuck Creek
+root_edge_uid <- 73853
+# #node id in of root_edge in original, pre-convert indexing
+# filter(as_tibble(sfn, "edges"), uid == root_edge_uid)$to
+
+#need separate declarations to assure node ID in to_local_neighborhood
+#and less importantly the order to search over
+sfn <- sf_3dhp |> sfnetworks::as_sfnetwork() 
+#reduces from ~74K to ~7K
+sfn <- sfn |> 
+  tidygraph::convert(
+    tidygraph::to_local_neighborhood,
+    node = filter(as_tibble(sfn, "edges"), uid == root_edge_uid)$to,
+    mode = "in", 
+    order = tidygraph::with_graph(sfn, tidygraph::graph_order())
+    ,
+    .clean = T
+  )
+
+# #already 'directed acyclic simple graph with 1 component'
+# #however, Pilchuck has a valid split path at node 1033
+
+#now add node attributes
+#note now has a different index value (from 73858 to 7131) due to `convert`
+root_node_idn <- filter(as_tibble(sfn, "edges"), uid == root_edge_uid)$to
+
+sfn <- sfn |> 
+  tidygraph::activate("nodes") |> 
+  mutate(
+    idn = seq_along(SHAPE),
+    #raindrop perspective paths from nodes to root
+    d_root = tidygraph::node_distance_to(root_node_idn),
+    d_root_ft = tidygraph::node_distance_to(root_node_idn, weights = length_ft),
+    d_root_km = 0.0003 * d_root_ft,
+    #looking 'up' perspective to perimeter from per-node 'me'
+    in_n = tidygraph::local_size(order = tidygraph::graph_order(), mode = "in", mindist = 1)
+    ) |> 
+  arrange(d_root) |> 
+#associate the immediately upstream streamlength from edges to each 'to' node
+#summed over both upstream tribs; also add 'below_culvert' logical:
+# defining per-node state in {no-incoming, not, culvert, not+not, culvert+not, culvert+culvert}
+  left_join(
+    select(as_tibble(as_tibble(sfn, active = "edges")), uid, idn = to, length_ft, dscrp, zslope_est, zmax) |>
+      summarise(
+        node_below_culvert = if_else(any(str_detect(dscrp, "ulvert")), T, F),
+        in_slope_max = max(zslope_est),
+        in_ft = sum(length_ft),
+        .by = "idn"),
+    by = "idn"
+  )
+
+#add 'above' neighborhood length after pruning by slope
+# #2421 NA node_below_culvert at upstream end of perimeter edges
+# as_tibble(as_tibble(sfn, "nodes")) |> count(node_below_culvert)
+
+#define a priori threshold to prune periphery by slope
+#plot.ecdf(as_tibble(sfn, "nodes")$in_slope_max)
+slope_threshold <- -0.3
+
+sfn_slp_prune <- sfn |>
+  tidygraph::activate("edges") |>
+  filter(zslope_est > slope_threshold) |> #greater than a negative value
+  tidygraph::convert(tidygraph::to_largest_component, .clean = T) |> 
+  tidygraph::activate("nodes") |> 
+  mutate(
+    idn = seq_along(SHAPE),
+    in_ft_all = tidygraph::map_local_dbl(
+      order = tidygraph::graph_order(), 
+      mode = "in",
+      .f = function(neighborhood, ...){
+        sum(as_tibble(neighborhood, active = 'nodes')$in_ft, na.rm = T)
+      }
+    ),
+    in_km_all = 0.0003 * in_ft_all,
+    in_ft_pct = in_ft_all / max(in_ft_all)
+  )
+```
+
+A first step to many assessments might involve limiting the network extent by gradient, excluding portions above a pre-defined slope threshold. The figure below illustrates the effect of removing sections relative to a threshold of `r abs(slope_threshold)`, including those that are themselves below the value but are upstream of a too-steep reach.
+
+```{r gg_sfn_pruned}
+{
+  ggplot() +
+    geom_sf(data = as_tibble(sfn, "edges"), aes(color = zslope_est)) +
+    wacolors::scale_color_wa_c("forest_fire")
+}+{
+  ggplot() +
+    geom_sf(data = as_tibble(sfn, "edges"), color = "tomato") +
+    geom_sf(data = as_tibble(sfn_slp_prune, "edges")) +
+    labs(subtitle = "Pruning by slope removes reaches exceeding a threshold as well as those above/upstream")
+}+ plot_layout(ncol = 1)
+```
+
+This directed network enables calculating two types of distance measures: incoming from immediate 'upstream' neighbors and outgoing to 'downstream' positions below.
+
+For the simplistic case that assumes all culverts are impassable barriers, the former can be thought of as one form of 'marginal linear habitat gain' if increased passability allows access to the next highest culvert (or the network perimeter if no upstream barriers). *Note, however, that a more complicated calculation is required to properly account for all upstream network lengths up to other remaining barriers.*
+
+```{r sfn_slp_prune_culv}
+#first rejoin topology attributes back to edges, limiting to culvert 
+sfn_slp_prune_culv <- as_tibble(sfn_slp_prune, active = "edges") |> 
+  filter(str_detect(dscrp, "ulvert")) |> 
+  left_join(
+    as_tibble(as_tibble(sfn_slp_prune, "nodes")) |> 
+      select(to = idn, 
+             #node_below_culvert, 
+             starts_with("d_"), 
+             in_ft, in_ft_all, in_km_all, in_ft_pct #starts_with("in_")
+      )
+    ,
+    by = "to"
+  )
+
+#next calculate 'in' and 'out' distance matrices for the entire (pruned) network 
+#direction "in" defines distances *from* upstream nodes
+#for first row (root node) equivalent to d_root_ft
+d_in <- sfnetworks::st_network_cost(
+  sfn_slp_prune, direction = 'in', 
+  weights = as_tibble(sfn_slp_prune, "edges")$length_ft)
+#per-row, the min distance is always 0 to self, the second (next largest in sort) is the nearest upstream
+#so when subset to the "to-node" of culvert edges becomes the closest upstream culvert, possibly Inf if none above
+#however need logic to use 'in_ft_all' if d_in==Inf since 'final' culverts may have lots of upstream length
+
+sfn_slp_prune_culv <- sfn_slp_prune_culv |> 
+  mutate(
+    d_culv_up = apply(d_in[to, to], 1, \(x) sort(x)[2])
+    ,
+    hmarg = if_else(is.infinite(d_culv_up), in_ft_all, d_culv_up)
+    ,
+    length_slope = abs(length_ft * as.vector(zslope_est))
+  )
+```
+
+This measure might be combined with some sort of tradeoff to ordinate locations. The figure below illustrates this idea with the simple product of segment length and slope (such that larger values indicate culverts that are longer, steeper or both).
+
+```{r gg_sfn_slp_prune_culv}
+{
+  ggplot() +
+    geom_sf(data = as_tibble(sfn_slp_prune, "edges"), linewidth = 0.1, color = "grey") +
+    geom_sf(
+      data = sfn_slp_prune_culv |> st_zm() |> st_centroid(),
+      aes(color = log10(hmarg))
+    ) +
+    wacolors::scale_color_wa_c("puget") +
+    labs(subtitle = "Culvert reaches in the slope-pruned Pilchuck example network \ncolored by distance to next upstream culvert or network perimeter")
+}+{
+  as_tibble(sfn_slp_prune_culv) |> 
+    ggplot() +
+    geom_point(aes(length_slope, hmarg, color = log10(hmarg)), show.legend = F) +
+    scale_y_log10() +
+    wacolors::scale_color_wa_c("puget") +
+    labs(subtitle = "Distance to next upstream culvert or network perimeter vs \nthe product of segment length and slope")
+} +
+  plot_layout(ncol = 1)
+```
+
+The outgoing or downstream distance can be used to distinguish features with no other intervening culverts on the path to the outlet or network 'root'.
+
+```{r sfn_slp_prune_lowest_culv}
+#direction "out" defines distances downstream to nodes below
+#first row (root/outlet) is all Inf other than 0 on diag
+#the per-row min is again always 0 to self but now the next largest is distance to nearest downstream
+#and when subset to culvert edge "to-node" means that Inf values are paths with no downstream culverts before the root
+#which is quite interesting for highlighting 'already open' paths or equivalently the lowest culvert in any subbasin!
+d_out <- sfnetworks::st_network_cost(
+  sfn_slp_prune, direction = 'out',
+  weights = as_tibble(sfn_slp_prune, "edges")$length_ft)
+
+#use this to get the subgraph of shortest paths from lowest culverts with none below to root
+lowest_culv <- sfn_slp_prune_culv$to[which(apply(d_out[sfn_slp_prune_culv$to, sfn_slp_prune_culv$to], 1, \(x) sort(x)[2])==Inf)]
+lowest_culv_paths <- sfnetworks::st_network_paths(sfn_slp_prune, from = 1, to = lowest_culv, mode = 'in')
+
+sfn_slp_prune_lowest_culv <- sfn_slp_prune |> 
+  tidygraph::activate("edges") |> 
+  slice(unique(unlist(lowest_culv_paths$edge_paths))) |> 
+  tidygraph::convert(
+    tidygraph::to_largest_component
+  )
+
+```
+
+```{r gg_sfn_slp_prune_lowest_culv}
+ggplot() +
+  geom_sf(data = as_tibble(sfn_slp_prune, "edges"), color = "lightblue") +
+  geom_sf(data = as_tibble(sfn_slp_prune_lowest_culv, "edges"), color = "darkgreen") +
+  labs(subtitle = "Example slope-pruned network of Pilchuck Ck (blue) \noverlaid with subgraph of 'open paths' from culvert segments with none below (green)")
+
+```
+
+These perspectives could be combined to answer the question "which culvert locations with unobstructed flow paths to the outlet have the longest upstream paths before another culvert or the network boundary?"
+
+```{r gg_sfn_slp_prune_culv_lowest_combo}
+{
+  sfn_slp_prune_culv |> 
+    mutate(lowest = to %in% lowest_culv) |> 
+    st_centroid() |> 
+    ggplot() + 
+    geom_sf(data = as_tibble(sfn_slp_prune, "edges"), linewidth = 0.1, color = "grey") +
+    geom_sf(
+      aes(color = log10(hmarg), alpha = lowest)
+    ) +
+    wacolors::scale_color_wa_c("puget") +
+    scale_alpha_manual(values = c(0.2, 0.9))
+}+{
+  as_tibble(sfn_slp_prune_culv) |> 
+    mutate(lowest = to %in% lowest_culv) |> 
+    ggplot() +
+    geom_point(aes(length_slope, hmarg, color = log10(hmarg), alpha = lowest), show.legend = F) +
+    scale_y_log10() +
+    wacolors::scale_color_wa_c("puget") +
+    scale_alpha_manual(values = c(0.2, 0.9))
+} +
+  plot_layout(ncol = 1)
+```
+
+```{r gg_sfn_slp_prune_culv_lowest_combo_focal}
+sfn_slp_prune_culv |> 
+  filter(
+    to %in% lowest_culv,
+    hmarg > 5000,
+    length_slope < 5
+    ) |> 
+  st_zm() |> st_centroid() |> 
+  ggplot() +
+  geom_sf(data = as_tibble(sfn_slp_prune, "edges"), linewidth = 0.1, color = "grey") +
+  geom_sf(aes(color = hmarg)) +
+  labs(subtitle = "Culverts segments with unobstructed paths to outlet,\n short lengths, low slopes, and longer potential upstream paths")
+```
+
+While this example suggests some of the potential utility of these data for evaluating and comparing network locations of culverts, further research is required to understand the strengths and weaknesses. In particular, additional information regarding channel dimensions and flow probabilities may help to reduce the uncertainty related to "marginal gains".
+
+```{r mapview_ex}
+sfn_slp_prune_culv |> 
+  filter(
+    to %in% lowest_culv,
+    hmarg > 5000,
+    length_slope < 5
+    ) |> 
+  st_zm() |> st_centroid() |> 
+  mapview::mapview()
+```
+
